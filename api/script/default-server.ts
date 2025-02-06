@@ -60,6 +60,7 @@ export function start(done: (err?: any, server?: express.Express, storage?: Stor
     })
     .then(() => {
       const app = express();
+      app.set("trust proxy", 1);
       const auth = api.auth({ storage: storage });
       const appInsights = api.appInsights();
       const redisManager = new RedisManager();
