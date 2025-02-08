@@ -758,6 +758,15 @@ export function getManagementRouter(config: ManagementConfig): Router {
   const releaseRateLimiter = rateLimit({
     windowMs: 15 * 60 * 1000, // 15 minutes
     max: 100, // limit each IP to 100 requests per windowMs
+    keyGenerator: (req) => {
+      const rawIp = req.ip || req.headers["x-forwarded-for"] || req.connection.remoteAddress;
+      
+      // Ensure the IP is a string (not an array)
+      const ip = Array.isArray(rawIp) ? rawIp[0] : rawIp;
+  
+      // Strip port if present
+      return typeof ip === "string" && ip.includes(":") ? ip.split(":")[0] : ip;
+    },
   });
 
   router.post("/apps/:appName/deployments/:deploymentName/release", releaseRateLimiter, (req: Request, res: Response, next: (err?: any) => void): any => {
