@@ -148,19 +148,25 @@ export function getAcquisitionRouter(config: AcquisitionConfig): express.Router 
       let fromCache: boolean = true;
       let redisError: Error;
 
+      console.log(`[UpdateCheck] Starting update check for deploymentKey: ${deploymentKey}, clientId: ${clientUniqueId}`);
+      console.log(`[UpdateCheck] Redis key: ${key}, url: ${url}`);
+
       redisManager
         .getCachedResponse(key, url)
         .catch((error: Error) => {
+          console.error(`[UpdateCheck] Redis cache error for key ${key}:`, error);
           // Store the redis error to be thrown after we send response.
           redisError = error;
           return q<redis.CacheableResponse>(null);
         })
         .then((cachedResponse: redis.CacheableResponse) => {
           fromCache = !!cachedResponse;
+          console.log(`[UpdateCheck] Cache hit: ${fromCache} for key: ${key}`);
           return cachedResponse || createResponseUsingStorage(req, res, storage);
         })
         .then((response: redis.CacheableResponse) => {
           if (!response) {
+            console.log(`[UpdateCheck] No response generated for key: ${key}`);
             return q<void>(null);
           }
 
@@ -174,6 +180,7 @@ export function getAcquisitionRouter(config: AcquisitionConfig): express.Router 
               cachedResponseObject.rollout,
               releaseSpecificString
             );
+            console.log(`[UpdateCheck] Rollout decision for clientId ${clientUniqueId}: ${giveRolloutPackage}`);
           }
 
           const updateCheckBody: { updateInfo: UpdateCheckResponse } = {
@@ -208,6 +215,10 @@ export function getAcquisitionRouter(config: AcquisitionConfig): express.Router 
     const previousLabelOrAppVersion = req.body.previousLabelOrAppVersion || req.body.previous_label_or_app_version;
     const clientUniqueId = req.body.clientUniqueId || req.body.client_unique_id;
 
+    console.log(`[ReportDeploy] Received status report - deploymentKey: ${deploymentKey}, appVersion: ${appVersion}`);
+    console.log(`[ReportDeploy] Previous state - deploymentKey: ${previousDeploymentKey}, labelOrVersion: ${previousLabelOrAppVersion}`);
+    console.log(`[ReportDeploy] Client ID: ${clientUniqueId}, Label: ${req.body.label}, Status: ${req.body.status}`);
+
     if (!deploymentKey || !appVersion) {
       return errorUtils.sendMalformedRequestError(res, "A deploy status report must contain a valid appVersion and deploymentKey.");
     } else if (req.body.label) {
@@ -219,14 +230,20 @@ export function getAcquisitionRouter(config: AcquisitionConfig): express.Router 
     }
 
     const sdkVersion: string = restHeaders.getSdkVersion(req);
+    console.log(`[ReportDeploy] SDK Version check - Received version: ${sdkVersion}, Breaking version: ${METRICS_BREAKING_VERSION}`);
+    console.log(`[ReportDeploy] Semver validation - Is valid: ${semver.valid(sdkVersion)}, Meets minimum version: ${semver.valid(sdkVersion) ? semver.gte(sdkVersion, METRICS_BREAKING_VERSION) : 'N/A'}`);
+
     if (semver.valid(sdkVersion) && semver.gte(sdkVersion, METRICS_BREAKING_VERSION)) {
+      console.log(`[ReportDeploy] Using new metrics format (SDK version: ${sdkVersion})`);
       // If previousDeploymentKey not provided, assume it is the same deployment key.
       let redisUpdatePromise: q.Promise<void>;
 
       if (req.body.label && req.body.status === redis.DEPLOYMENT_FAILED) {
+        console.log(`[ReportDeploy] Recording deployment failure for label: ${req.body.label}`);
         redisUpdatePromise = redisManager.incrementLabelStatusCount(deploymentKey, req.body.label, req.body.status);
       } else {
         const labelOrAppVersion: string = req.body.label || appVersion;
+        console.log(`[ReportDeploy] Recording successful update to: ${labelOrAppVersion}`);
         redisUpdatePromise = redisManager.recordUpdate(
           deploymentKey,
           labelOrAppVersion,
@@ -237,15 +254,23 @@ export function getAcquisitionRouter(config: AcquisitionConfig): express.Router 
 
       redisUpdatePromise
         .then(() => {
+          console.log(`[ReportDeploy] Successfully recorded metrics for deploymentKey: ${deploymentKey}`);
           res.sendStatus(200);
           if (clientUniqueId) {
+            console.log(`[ReportDeploy] Cleaning up client active label - clientId: ${clientUniqueId}`);
             redisManager.removeDeploymentKeyClientActiveLabel(previousDeploymentKey, clientUniqueId);
           }
         })
-        .catch((error: any) => errorUtils.sendUnknownError(res, error, next))
+        .catch((error: any) => {
+          console.error(`[ReportDeploy] Failed to record metrics:`, error);
+          errorUtils.sendUnknownError(res, error, next);
+        })
         .done();
     } else {
+      console.log(`[ReportDeploy] Using legacy metrics format - Invalid or outdated SDK version: ${sdkVersion}`);
+      
       if (!clientUniqueId) {
+        console.log(`[ReportDeploy] Legacy format requires clientUniqueId but none provided`);
         return errorUtils.sendMalformedRequestError(
           res,
           "A deploy status report must contain a valid appVersion, clientUniqueId and deploymentKey."
@@ -255,26 +280,39 @@ export function getAcquisitionRouter(config: AcquisitionConfig): express.Router 
       return redisManager
         .getCurrentActiveLabel(deploymentKey, clientUniqueId)
         .then((currentVersionLabel: string) => {
+          console.log(`[ReportDeploy] Legacy - Current active label for client ${clientUniqueId}: ${currentVersionLabel}`);
+          
           if (req.body.label && req.body.label !== currentVersionLabel) {
+            console.log(`[ReportDeploy] Legacy - Updating metrics for new label: ${req.body.label}`);
             return redisManager.incrementLabelStatusCount(deploymentKey, req.body.label, req.body.status).then(() => {
               if (req.body.status === redis.DEPLOYMENT_SUCCEEDED) {
+                console.log(`[ReportDeploy] Legacy - Updating active app for successful deployment`);
                 return redisManager.updateActiveAppForClient(deploymentKey, clientUniqueId, req.body.label, currentVersionLabel);
               }
             });
           } else if (!req.body.label && appVersion !== currentVersionLabel) {
+            console.log(`[ReportDeploy] Legacy - Updating active app version to: ${appVersion}`);
             return redisManager.updateActiveAppForClient(deploymentKey, clientUniqueId, appVersion, appVersion);
+          } else {
+            console.log(`[ReportDeploy] Legacy - No update needed, versions match`);
           }
         })
         .then(() => {
+          console.log(`[ReportDeploy] Legacy - Successfully completed status update`);
           res.sendStatus(200);
         })
-        .catch((error: any) => errorUtils.sendUnknownError(res, error, next))
+        .catch((error: any) => {
+          console.error(`[ReportDeploy] Legacy - Failed to update status:`, error);
+          errorUtils.sendUnknownError(res, error, next);
+        })
         .done();
     }
   };
 
   const reportStatusDownload = function (req: express.Request, res: express.Response, next: (err?: any) => void) {
     const deploymentKey = req.body.deploymentKey || req.body.deployment_key;
+    console.log(`[ReportDownload] Recording download for deploymentKey: ${deploymentKey}, label: ${req.body.label}`);
+    
     if (!req.body || !deploymentKey || !req.body.label) {
       return errorUtils.sendMalformedRequestError(
         res,
@@ -284,9 +322,13 @@ export function getAcquisitionRouter(config: AcquisitionConfig): express.Router 
     return redisManager
       .incrementLabelStatusCount(deploymentKey, req.body.label, redis.DOWNLOADED)
       .then(() => {
+        console.log(`[ReportDownload] Successfully recorded download for label: ${req.body.label}`);
         res.sendStatus(200);
       })
-      .catch((error: any) => errorUtils.sendUnknownError(res, error, next))
+      .catch((error: any) => {
+        console.error(`[ReportDownload] Failed to record download:`, error);
+        errorUtils.sendUnknownError(res, error, next);
+      })
       .done();
   };
 
