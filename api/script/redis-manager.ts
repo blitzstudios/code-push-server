@@ -98,7 +98,10 @@ export class RedisManager {
   private _setupMetricsClientPromise: Promise<void>;
 
   constructor() {
+    console.error('Redis Manager started');
+
     if (process.env.REDIS_HOST && process.env.REDIS_PORT) {
+      console.log(`Initializing Redis with host: ${process.env.REDIS_HOST}, port: ${process.env.REDIS_PORT}`);
       const redisConfig = {
         host: process.env.REDIS_HOST,
         port: process.env.REDIS_PORT,
@@ -110,19 +113,35 @@ export class RedisManager {
       };
       this._opsClient = redis.createClient(redisConfig);
       this._metricsClient = redis.createClient(redisConfig);
+      
+      this._opsClient.on("connect", () => {
+        console.log("Operations Redis client connected successfully");
+      });
+
+      this._metricsClient.on("connect", () => {
+        console.log("Metrics Redis client connected successfully");
+      });
+
       this._opsClient.on("error", (err: Error) => {
-        console.error(err);
+        console.error("Operations Redis client error:", err);
       });
 
       this._metricsClient.on("error", (err: Error) => {
-        console.error(err);
+        console.error("Metrics Redis client error:", err);
       });
 
       this._promisifiedOpsClient = new PromisifiedRedisClient(this._opsClient);
       this._promisifiedMetricsClient = new PromisifiedRedisClient(this._metricsClient);
       this._setupMetricsClientPromise = this._promisifiedMetricsClient
         .select(RedisManager.METRICS_DB)
-        .then(() => this._promisifiedMetricsClient.set("health", "health"));
+        .then(() => {
+          console.log(`Selected Redis DB ${RedisManager.METRICS_DB} for metrics`);
+          return this._promisifiedMetricsClient.set("health", "health");
+        })
+        .catch(err => {
+          console.error("Failed to setup metrics client:", err);
+          throw err;
+        });
     } else {
       console.warn("No REDIS_HOST or REDIS_PORT environment variable configured.");
     }
@@ -134,6 +153,7 @@ export class RedisManager {
 
   public checkHealth(): Promise<void> {
     if (!this.isEnabled) {
+      console.error('Redis manager is not enabled');
       return q.reject<void>("Redis manager is not enabled");
     }
 
@@ -193,13 +213,23 @@ export class RedisManager {
   // or 1 by default. If the field does not exist, it will be created with the value of 1.
   public incrementLabelStatusCount(deploymentKey: string, label: string, status: string): Promise<void> {
     if (!this.isEnabled) {
+      console.log("Redis not enabled, skipping incrementLabelStatusCount");
       return q(<void>null);
     }
 
     const hash: string = Utilities.getDeploymentKeyLabelsHash(deploymentKey);
     const field: string = Utilities.getLabelStatusField(label, status);
+    console.log(`Incrementing metrics - Hash: ${hash}, Field: ${field}`);
 
-    return this._setupMetricsClientPromise.then(() => this._promisifiedMetricsClient.hincrby(hash, field, 1)).then(() => {});
+    return this._setupMetricsClientPromise
+      .then(() => this._promisifiedMetricsClient.hincrby(hash, field, 1))
+      .then((newValue) => {
+        console.log(`Successfully incremented ${field} to ${newValue}`);
+      })
+      .catch(err => {
+        console.error(`Failed to increment label status count for ${hash}:${field}:`, err);
+        throw err;
+      });
   }
 
   public clearMetricsForDeploymentKey(deploymentKey: string): Promise<void> {
@@ -221,12 +251,17 @@ export class RedisManager {
   // { "v1:DeploymentSucceeded": 123, "v1:DeploymentFailed": 4, "v1:Active": 123 ... }
   public getMetricsWithDeploymentKey(deploymentKey: string): Promise<DeploymentMetrics> {
     if (!this.isEnabled) {
+      console.log("Redis not enabled, skipping getMetricsWithDeploymentKey");
       return q(<DeploymentMetrics>null);
     }
 
+    const hash = Utilities.getDeploymentKeyLabelsHash(deploymentKey);
+    console.log(`Fetching metrics for deployment key hash: ${hash}`);
+
     return this._setupMetricsClientPromise
-      .then(() => this._promisifiedMetricsClient.hgetall(Utilities.getDeploymentKeyLabelsHash(deploymentKey)))
+      .then(() => this._promisifiedMetricsClient.hgetall(hash))
       .then((metrics) => {
+        console.log(`Raw metrics for ${hash}:`, metrics);
         // Redis returns numerical values as strings, handle parsing here.
         if (metrics) {
           Object.keys(metrics).forEach((metricField) => {
@@ -234,16 +269,26 @@ export class RedisManager {
               metrics[metricField] = +metrics[metricField];
             }
           });
+          console.log(`Parsed metrics for ${hash}:`, metrics);
+        } else {
+          console.log(`No metrics found for ${hash}`);
         }
 
         return <DeploymentMetrics>metrics;
+      })
+      .catch(err => {
+        console.error(`Failed to get metrics for ${hash}:`, err);
+        throw err;
       });
   }
 
   public recordUpdate(currentDeploymentKey: string, currentLabel: string, previousDeploymentKey?: string, previousLabel?: string) {
     if (!this.isEnabled) {
+      console.log("Redis not enabled, skipping recordUpdate");
       return q(<void>null);
     }
+
+    console.log(`Recording update - Current: ${currentDeploymentKey}:${currentLabel}, Previous: ${previousDeploymentKey}:${previousLabel}`);
 
     return this._setupMetricsClientPromise
       .then(() => {
@@ -251,18 +296,29 @@ export class RedisManager {
         const currentDeploymentKeyLabelsHash: string = Utilities.getDeploymentKeyLabelsHash(currentDeploymentKey);
         const currentLabelActiveField: string = Utilities.getLabelActiveCountField(currentLabel);
         const currentLabelDeploymentSucceededField: string = Utilities.getLabelStatusField(currentLabel, DEPLOYMENT_SUCCEEDED);
+        
+        console.log(`Updating metrics - Hash: ${currentDeploymentKeyLabelsHash}`);
+        console.log(`Fields to increment: ${currentLabelActiveField}, ${currentLabelDeploymentSucceededField}`);
+
         batchClient.hincrby(currentDeploymentKeyLabelsHash, currentLabelActiveField, /* incrementBy */ 1);
         batchClient.hincrby(currentDeploymentKeyLabelsHash, currentLabelDeploymentSucceededField, /* incrementBy */ 1);
 
         if (previousDeploymentKey && previousLabel) {
           const previousDeploymentKeyLabelsHash: string = Utilities.getDeploymentKeyLabelsHash(previousDeploymentKey);
           const previousLabelActiveField: string = Utilities.getLabelActiveCountField(previousLabel);
+          console.log(`Decrementing previous metrics - Hash: ${previousDeploymentKeyLabelsHash}, Field: ${previousLabelActiveField}`);
           batchClient.hincrby(previousDeploymentKeyLabelsHash, previousLabelActiveField, /* incrementBy */ -1);
         }
 
         return this._promisifiedMetricsClient.execBatch(batchClient);
       })
-      .then(() => {});
+      .then((results) => {
+        console.log("Batch update results:", results);
+      })
+      .catch(err => {
+        console.error("Failed to record update:", err);
+        throw err;
+      });
   }
 
   public removeDeploymentKeyClientActiveLabel(deploymentKey: string, clientUniqueId: string) {
