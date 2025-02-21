@@ -168,16 +168,23 @@ export class RedisManager {
    */
   public getCachedResponse(expiryKey: string, url: string): Promise<CacheableResponse> {
     if (!this.isEnabled) {
+      console.log(`[Redis] Cache disabled, skipping getCachedResponse for key: ${expiryKey}`);
       return q<CacheableResponse>(null);
     }
 
+    console.log(`[Redis] Attempting to get cached response - Key: ${expiryKey}, URL: ${url}`);
     return this._promisifiedOpsClient.hget(expiryKey, url).then((serializedResponse: string): Promise<CacheableResponse> => {
       if (serializedResponse) {
+        console.log(`[Redis] Found cached response for key: ${expiryKey}`);
         const response = <CacheableResponse>JSON.parse(serializedResponse);
         return q<CacheableResponse>(response);
       } else {
+        console.log(`[Redis] No cached response found for key: ${expiryKey}`);
         return q<CacheableResponse>(null);
       }
+    }).catch(err => {
+      console.error(`[Redis] Error getting cached response for key ${expiryKey}:`, err);
+      throw err;
     });
   }
 
@@ -189,9 +196,11 @@ export class RedisManager {
    */
   public setCachedResponse(expiryKey: string, url: string, response: CacheableResponse): Promise<void> {
     if (!this.isEnabled) {
+      console.log(`[Redis] Cache disabled, skipping setCachedResponse for key: ${expiryKey}`);
       return q<void>(null);
     }
 
+    console.log(`[Redis] Setting cached response - Key: ${expiryKey}, URL: ${url}`);
     // Store response in cache with a timed expiry
     const serializedResponse: string = JSON.stringify(response);
     let isNewKey: boolean;
@@ -199,35 +208,46 @@ export class RedisManager {
       .exists(expiryKey)
       .then((isExisting: number) => {
         isNewKey = !isExisting;
+        console.log(`[Redis] Key ${expiryKey} exists: ${!isNewKey}`);
         return this._promisifiedOpsClient.hset(expiryKey, url, serializedResponse);
       })
       .then(() => {
         if (isNewKey) {
+          console.log(`[Redis] Setting expiry for new key: ${expiryKey}`);
           return this._promisifiedOpsClient.expire(expiryKey, RedisManager.DEFAULT_EXPIRY);
         }
       })
-      .then(() => {});
+      .then(() => {
+        console.log(`[Redis] Successfully cached response for key: ${expiryKey}`);
+      })
+      .catch(err => {
+        console.error(`[Redis] Error setting cached response for key ${expiryKey}:`, err);
+        throw err;
+      });
   }
 
   // Atomically increments the status field for the deployment by 1,
   // or 1 by default. If the field does not exist, it will be created with the value of 1.
   public incrementLabelStatusCount(deploymentKey: string, label: string, status: string): Promise<void> {
     if (!this.isEnabled) {
-      console.log("Redis not enabled, skipping incrementLabelStatusCount");
+      console.log(`[Redis] Cache disabled, skipping incrementLabelStatusCount for key: ${deploymentKey}`);
       return q(<void>null);
     }
 
     const hash: string = Utilities.getDeploymentKeyLabelsHash(deploymentKey);
     const field: string = Utilities.getLabelStatusField(label, status);
-    console.log(`Incrementing metrics - Hash: ${hash}, Field: ${field}`);
+    console.log(`[Redis] Incrementing metrics - Hash: ${hash}, Field: ${field}`);
 
     return this._setupMetricsClientPromise
-      .then(() => this._promisifiedMetricsClient.hincrby(hash, field, 1))
+      .then(() => {
+        console.log(`[Redis] Connected to metrics DB, incrementing count`);
+        return this._promisifiedMetricsClient.hincrby(hash, field, 1);
+      })
       .then((newValue) => {
-        console.log(`Successfully incremented ${field} to ${newValue}`);
+        console.log(`[Redis] Successfully incremented ${field} to ${newValue}`);
       })
       .catch(err => {
-        console.error(`Failed to increment label status count for ${hash}:${field}:`, err);
+        console.error(`[Redis] Failed to increment label status count for ${hash}:${field}:`, err);
         throw err;
       });
   }
@@ -251,17 +271,20 @@ export class RedisManager {
   // { "v1:DeploymentSucceeded": 123, "v1:DeploymentFailed": 4, "v1:Active": 123 ... }
   public getMetricsWithDeploymentKey(deploymentKey: string): Promise<DeploymentMetrics> {
     if (!this.isEnabled) {
-      console.log("Redis not enabled, skipping getMetricsWithDeploymentKey");
+      console.log(`[Redis] Cache disabled, skipping getMetricsWithDeploymentKey for key: ${deploymentKey}`);
       return q(<DeploymentMetrics>null);
     }
 
     const hash = Utilities.getDeploymentKeyLabelsHash(deploymentKey);
-    console.log(`Fetching metrics for deployment key hash: ${hash}`);
+    console.log(`[Redis] Fetching metrics for deployment key hash: ${hash}`);
 
     return this._setupMetricsClientPromise
-      .then(() => this._promisifiedMetricsClient.hgetall(hash))
+      .then(() => {
+        console.log(`[Redis] Connected to metrics DB, fetching metrics`);
+        return this._promisifiedMetricsClient.hgetall(hash);
+      })
       .then((metrics) => {
-        console.log(`Raw metrics for ${hash}:`, metrics);
+        console.log(`[Redis] Raw metrics for ${hash}:`, metrics);
         // Redis returns numerical values as strings, handle parsing here.
         if (metrics) {
           Object.keys(metrics).forEach((metricField) => {
@@ -269,36 +292,37 @@ export class RedisManager {
               metrics[metricField] = +metrics[metricField];
             }
           });
-          console.log(`Parsed metrics for ${hash}:`, metrics);
+          console.log(`[Redis] Parsed metrics for ${hash}:`, metrics);
         } else {
-          console.log(`No metrics found for ${hash}`);
+          console.log(`[Redis] No metrics found for ${hash}`);
         }
 
         return <DeploymentMetrics>metrics;
       })
       .catch(err => {
-        console.error(`Failed to get metrics for ${hash}:`, err);
+        console.error(`[Redis] Failed to get metrics for ${hash}:`, err);
         throw err;
       });
   }
 
   public recordUpdate(currentDeploymentKey: string, currentLabel: string, previousDeploymentKey?: string, previousLabel?: string) {
     if (!this.isEnabled) {
-      console.log("Redis not enabled, skipping recordUpdate");
+      console.log(`[Redis] Cache disabled, skipping recordUpdate for key: ${currentDeploymentKey}`);
       return q(<void>null);
     }
 
-    console.log(`Recording update - Current: ${currentDeploymentKey}:${currentLabel}, Previous: ${previousDeploymentKey}:${previousLabel}`);
+    console.log(`[Redis] Recording update - Current: ${currentDeploymentKey}:${currentLabel}, Previous: ${previousDeploymentKey}:${previousLabel}`);
 
     return this._setupMetricsClientPromise
       .then(() => {
+        console.log(`[Redis] Connected to metrics DB, preparing batch update`);
         const batchClient: any = (<any>this._metricsClient).batch();
         const currentDeploymentKeyLabelsHash: string = Utilities.getDeploymentKeyLabelsHash(currentDeploymentKey);
         const currentLabelActiveField: string = Utilities.getLabelActiveCountField(currentLabel);
         const currentLabelDeploymentSucceededField: string = Utilities.getLabelStatusField(currentLabel, DEPLOYMENT_SUCCEEDED);
         
-        console.log(`Updating metrics - Hash: ${currentDeploymentKeyLabelsHash}`);
-        console.log(`Fields to increment: ${currentLabelActiveField}, ${currentLabelDeploymentSucceededField}`);
+        console.log(`[Redis] Updating metrics - Hash: ${currentDeploymentKeyLabelsHash}`);
+        console.log(`[Redis] Fields to increment: ${currentLabelActiveField}, ${currentLabelDeploymentSucceededField}`);
 
         batchClient.hincrby(currentDeploymentKeyLabelsHash, currentLabelActiveField, /* incrementBy */ 1);
         batchClient.hincrby(currentDeploymentKeyLabelsHash, currentLabelDeploymentSucceededField, /* incrementBy */ 1);
@@ -306,17 +330,18 @@ export class RedisManager {
         if (previousDeploymentKey && previousLabel) {
           const previousDeploymentKeyLabelsHash: string = Utilities.getDeploymentKeyLabelsHash(previousDeploymentKey);
           const previousLabelActiveField: string = Utilities.getLabelActiveCountField(previousLabel);
-          console.log(`Decrementing previous metrics - Hash: ${previousDeploymentKeyLabelsHash}, Field: ${previousLabelActiveField}`);
+          console.log(`[Redis] Decrementing previous metrics - Hash: ${previousDeploymentKeyLabelsHash}, Field: ${previousLabelActiveField}`);
           batchClient.hincrby(previousDeploymentKeyLabelsHash, previousLabelActiveField, /* incrementBy */ -1);
         }
 
+        console.log(`[Redis] Executing batch update`);
         return this._promisifiedMetricsClient.execBatch(batchClient);
       })
       .then((results) => {
-        console.log("Batch update results:", results);
+        console.log(`[Redis] Batch update results:`, results);
       })
       .catch(err => {
-        console.error("Failed to record update:", err);
+        console.error(`[Redis] Failed to record update:`, err);
         throw err;
       });
   }

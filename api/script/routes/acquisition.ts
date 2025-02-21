@@ -42,6 +42,8 @@ function createResponseUsingStorage(
   const packageHash: string = String(req.query.packageHash || req.query.package_hash);
   const isCompanion: string = String(req.query.isCompanion || req.query.is_companion);
 
+  console.log(`[Storage] Creating response - deploymentKey: ${deploymentKey}, appVersion: ${appVersion}, packageHash: ${packageHash}`);
+
   const updateRequest: UpdateCheckRequest = {
     deploymentKey: deploymentKey,
     appVersion: appVersion,
@@ -57,6 +59,7 @@ function createResponseUsingStorage(
   if (isPlainIntegerNumber) {
     originalAppVersion = updateRequest.appVersion;
     updateRequest.appVersion = originalAppVersion + ".0.0";
+    console.log(`[Storage] Converting plain integer version ${originalAppVersion} to semver: ${updateRequest.appVersion}`);
   }
 
   // Make an exception to allow missing patch versions e.g. "2.0" or "2.0-prerelease"
@@ -69,17 +72,23 @@ function createResponseUsingStorage(
     } else {
       updateRequest.appVersion = originalAppVersion.slice(0, semverTagIndex) + ".0" + originalAppVersion.slice(semverTagIndex);
     }
+    console.log(`[Storage] Adding missing patch version. Original: ${originalAppVersion}, Modified: ${updateRequest.appVersion}`);
   }
 
   if (validationUtils.isValidUpdateCheckRequest(updateRequest)) {
+    console.log(`[Storage] Valid update check request, fetching package history`);
     return storage.getPackageHistoryFromDeploymentKey(updateRequest.deploymentKey).then((packageHistory: storageTypes.Package[]) => {
+      console.log(`[Storage] Retrieved ${packageHistory?.length || 0} packages from history`);
       const updateObject: UpdateCheckCacheResponse = acquisitionUtils.getUpdatePackageInfo(packageHistory, updateRequest);
+      console.log(`[Storage] Generated update package info:`, JSON.stringify(updateObject, null, 2));
+      
       if ((isMissingPatchVersion || isPlainIntegerNumber) && updateObject.originalPackage.appVersion === updateRequest.appVersion) {
         // Set the appVersion of the response to the original one with the missing patch version or plain number
         updateObject.originalPackage.appVersion = originalAppVersion;
         if (updateObject.rolloutPackage) {
           updateObject.rolloutPackage.appVersion = originalAppVersion;
         }
+        console.log(`[Storage] Restored original version format: ${originalAppVersion}`);
       }
 
       const cacheableResponse: redis.CacheableResponse = {
@@ -87,9 +96,12 @@ function createResponseUsingStorage(
         body: updateObject,
       };
 
+      console.log(`[Storage] Created cacheable response with status ${cacheableResponse.statusCode}`);
       return q(cacheableResponse);
     });
   } else {
+    console.log(`[Storage] Invalid update check request - deploymentKey valid: ${validationUtils.isValidKeyField(updateRequest.deploymentKey)}, appVersion valid: ${validationUtils.isValidAppVersionField(updateRequest.appVersion)}`);
+    
     if (!validationUtils.isValidKeyField(updateRequest.deploymentKey)) {
       errorUtils.sendMalformedRequestError(
         res,
@@ -195,7 +207,13 @@ export function getAcquisitionRouter(config: AcquisitionConfig): express.Router 
 
           // Update REDIS cache after sending the response so that we don't block the request.
           if (!fromCache) {
-            return redisManager.setCachedResponse(key, url, response);
+            console.log(`[UpdateCheck] Setting cached response for key: ${key}`);
+            return redisManager.setCachedResponse(key, url, response).then(() => {
+              console.log(`[UpdateCheck] Successfully cached response for key: ${key}`);
+            }).catch(err => {
+              console.error(`[UpdateCheck] Failed to cache response for key: ${key}:`, err);
+              throw err;
+            });
           }
         })
         .then(() => {
