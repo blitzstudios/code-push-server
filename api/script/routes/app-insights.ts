@@ -41,7 +41,7 @@ interface ServiceResourceDefinition {
   tag: string;
 }
 
-const INSTRUMENTATION_KEY = process.env["APP_INSIGHTS_INSTRUMENTATION_KEY"];
+const INSTRUMENTATION_KEY = process.env["APPINSIGHTS_INSTRUMENTATIONKEY"];
 
 export class AppInsights {
   private static ORIGIN_TAG = "Origin";
