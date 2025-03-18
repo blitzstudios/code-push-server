@@ -528,7 +528,7 @@ export class JsonStorage implements storage.Storage {
     return q(<void>null);
   }
 
-  public addBlob(blobId: string, stream: stream.Readable, streamLength: number): Promise<string> {
+  public addBlob(blobId: string, stream: stream.Readable, streamLength: number, contentType?: string): q.Promise<string> {
     this.blobs[blobId] = "";
     return q.Promise<string>((resolve: (blobId: string) => void) => {
       stream

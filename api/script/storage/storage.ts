@@ -158,7 +158,7 @@ export interface Storage {
   getPackageHistory(accountId: string, appId: string, deploymentId: string): Promise<Package[]>;
   updatePackageHistory(accountId: string, appId: string, deploymentId: string, history: Package[]): Promise<void>;
 
-  addBlob(blobId: string, addstream: stream.Readable, streamLength: number): Promise<string>;
+  addBlob(blobId: string, addstream: stream.Readable, streamLength: number, contentType?: string): Promise<string>;
   getBlobUrl(blobId: string): Promise<string>;
   removeBlob(blobId: string): Promise<void>;
 
