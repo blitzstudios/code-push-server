@@ -49,29 +49,51 @@ export class PackageDiffer {
     newPackage: storageTypes.Package
   ): Promise<storageTypes.PackageHashToBlobInfoMap> {
     if (!newPackage || !newPackage.blobUrl || !newPackage.manifestBlobUrl) {
+      console.log(`[generateDiffPackageMap] Missing required package info. blobUrl: ${!!newPackage?.blobUrl}, manifestBlobUrl: ${!!newPackage?.manifestBlobUrl}`);
       return q.reject<storageTypes.PackageHashToBlobInfoMap>(
         diffErrorUtils.diffError(diffErrorUtils.ErrorCode.InvalidArguments, "Package information missing")
       );
     }
 
+    console.log(`[generateDiffPackageMap] Starting for package ${newPackage.label}, hash: ${newPackage.packageHash}`);
+    console.log(`[generateDiffPackageMap] Manifest URL: ${newPackage.manifestBlobUrl}`);
+    
     const manifestPromise: Promise<PackageManifest> = this.getManifest(newPackage);
     const historyPromise: Promise<storageTypes.Package[]> = this._storage.getPackageHistory(accountId, appId, deploymentId);
     const newReleaseFilePromise: Promise<string> = this.downloadArchiveFromUrl(newPackage.blobUrl);
     let newFilePath: string;
 
+    console.log(`[generateDiffPackageMap] Promises created for manifest, history, and download`);
+
     return q
       .all<any>([manifestPromise, historyPromise, newReleaseFilePromise])
       .spread((newManifest: PackageManifest, history: storageTypes.Package[], downloadedArchiveFile: string) => {
         newFilePath = downloadedArchiveFile;
+        
+        console.log(`[generateDiffPackageMap] Got manifest: ${newManifest ? 'yes' : 'no'}, history: ${history?.length || 0} packages, downloaded file: ${!!downloadedArchiveFile}`);
+        
+        if (!newManifest) {
+          console.log(`[generateDiffPackageMap] No manifest available, cannot generate diffs`);
+          return [];
+        }
+        
+        const fileMap = newManifest.toMap();
+        const fileCount = Object.keys(fileMap || {}).length;
+        console.log(`[generateDiffPackageMap] Manifest contains ${fileCount} files`);
+        
         const packagesToDiff: storageTypes.Package[] = this.getPackagesToDiff(
           history,
           newPackage.appVersion,
           newPackage.packageHash,
           newPackage.label
         );
+        
+        console.log(`[generateDiffPackageMap] Found ${packagesToDiff?.length || 0} packages to diff against`);
+        
         const diffBlobInfoPromises: Promise<DiffBlobInfo>[] = [];
         if (packagesToDiff) {
           packagesToDiff.forEach((appPackage: storageTypes.Package) => {
+            console.log(`[generateDiffPackageMap] Adding diff task for package ${appPackage.label}, hash: ${appPackage.packageHash}`);
             diffBlobInfoPromises.push(
               this.uploadAndGetDiffBlobInfo(accountId, appPackage, newPackage.packageHash, newManifest, newFilePath)
             );
@@ -84,117 +106,133 @@ export class PackageDiffer {
         // all done, delete the downloaded archive file.
         fs.unlinkSync(newFilePath);
 
+        console.log(`[generateDiffPackageMap] Processed ${diffBlobInfoList?.length || 0} diffs`);
+        
         if (diffBlobInfoList && diffBlobInfoList.length) {
           let diffPackageMap: storageTypes.PackageHashToBlobInfoMap = null;
           diffBlobInfoList.forEach((diffBlobInfo: DiffBlobInfo) => {
             if (diffBlobInfo && diffBlobInfo.blobInfo) {
               diffPackageMap = diffPackageMap || {};
               diffPackageMap[diffBlobInfo.packageHash] = diffBlobInfo.blobInfo;
+              console.log(`[generateDiffPackageMap] Added diff for package hash ${diffBlobInfo.packageHash}, size: ${diffBlobInfo.blobInfo.size} bytes`);
             }
           });
 
+          console.log(`[generateDiffPackageMap] Returning diff package map with ${Object.keys(diffPackageMap || {}).length} entries`);
           return diffPackageMap;
         } else {
+          console.log(`[generateDiffPackageMap] No diff packages were generated`);
           return q<storageTypes.PackageHashToBlobInfoMap>(null);
         }
       })
-      .catch(diffErrorUtils.diffErrorHandler);
+      .catch((error) => {
+        console.error(`[generateDiffPackageMap] Error: ${error.message || error}`);
+        return diffErrorUtils.diffErrorHandler(error);
+      });
   }
 
   public generateDiffArchive(oldManifest: PackageManifest, newManifest: PackageManifest, newArchiveFilePath: string): Promise<string> {
     return Promise<string>(
       (resolve: (value?: string | Promise<string>) => void, reject: (reason: any) => void, notify: (progress: any) => void): void => {
+        console.log(`[generateDiffArchive] Starting generation`);
+        
         if (!oldManifest || !newManifest) {
+          console.log(`[generateDiffArchive] Missing manifests - oldManifest: ${!!oldManifest}, newManifest: ${!!newManifest}`);
           resolve(null);
           return;
         }
 
         const diff: IArchiveDiff = PackageDiffer.generateDiff(oldManifest.toMap(), newManifest.toMap());
+        console.log(`[generateDiffArchive] Generated diff - deletedFiles: ${diff.deletedFiles.length}, newOrUpdatedFiles: ${diff.newOrUpdatedEntries.size}`);
 
         if (diff.deletedFiles.length === 0 && diff.newOrUpdatedEntries.size === 0) {
+          console.log(`[generateDiffArchive] No differences found, skipping archive creation`);
           resolve(null);
           return;
         }
 
         PackageDiffer.ensureWorkDirectoryExists();
+        console.log(`[generateDiffArchive] Work directory exists`);
 
         const diffFilePath = path.join(PackageDiffer.WORK_DIRECTORY_PATH, "diff_" + PackageDiffer.randomString(20) + ".zip");
+        console.log(`[generateDiffArchive] Will create diff archive at: ${diffFilePath}`);
+        
         const writeStream: stream.Writable = fs.createWriteStream(diffFilePath);
         const diffFile = new yazl.ZipFile();
 
         diffFile.outputStream.pipe(writeStream).on("close", (): void => {
+          console.log(`[generateDiffArchive] Successfully created diff archive: ${diffFilePath}`);
           resolve(diffFilePath);
         });
 
         const json: string = JSON.stringify({ deletedFiles: diff.deletedFiles });
+        console.log(`[generateDiffArchive] Added manifest with ${diff.deletedFiles.length} deleted files`);
         const readStream: stream.Readable = streamifier.createReadStream(json);
         diffFile.addReadStream(readStream, PackageDiffer.MANIFEST_FILE_NAME);
 
-        if (diff.newOrUpdatedEntries.size > 0) {
-          yauzl.open(newArchiveFilePath, (error?: any, zipFile?: yauzl.ZipFile): void => {
-            if (error) {
-              reject(error);
-              return;
-            }
+        // Iterate through the diff entries to avoid memory overrun when dealing
+        // with large files
+        console.log(`[generateDiffArchive] Opening source archive: ${newArchiveFilePath}`);
+        yauzl.open(newArchiveFilePath, { lazyEntries: true }, (err?: Error, zipFile?: any): void => {
+          if (err) {
+            console.error(`[generateDiffArchive] Error opening source archive: ${err.message}`);
+            reject(err);
+            return;
+          }
 
-            zipFile
-              .on("error", (error: any): void => {
-                reject(error);
-              })
-              .on("entry", (entry: yauzl.IEntry): void => {
-                if (
-                  !PackageDiffer.isEntryInMap(entry.fileName, /*hash*/ null, diff.newOrUpdatedEntries, /*requireContentMatch*/ false)
-                ) {
-                  return;
-                } else if (/\/$/.test(entry.fileName)) {
-                  // this is a directory
-                  diffFile.addEmptyDirectory(entry.fileName);
+          zipFile.readEntry();
+          zipFile
+            .on("entry", (entry: any): void => {
+              // Skip processing non-file entries.
+              if (entry.fileName.endsWith("/")) {
+                zipFile.readEntry();
+                return;
+              }
+
+              const fileName: string = PackageManifest.normalizePath(entry.fileName);
+              // Skip processing files that don't match certain conditions.
+              if (PackageManifest.isIgnored(fileName)) {
+                zipFile.readEntry();
+                return;
+              }
+
+              // Add an updated file to the diff zip file if it's new or changed
+              for (const [fileNameHash, fileHash] of diff.newOrUpdatedEntries) {
+                if (fileNameHash === fileName) {
+                  zipFile.openReadStream(entry, (entryErr?: Error, readStream?: stream.Readable): void => {
+                    if (entryErr) {
+                      console.error(`[generateDiffArchive] Error opening read stream for entry ${fileName}: ${entryErr.message}`);
+                      reject(entryErr);
+                      return;
+                    }
+
+                    console.log(`[generateDiffArchive] Adding updated/new file to diff: ${fileName}`);
+                    diffFile.addReadStream(readStream, fileName);
+                    diff.newOrUpdatedEntries.delete(fileNameHash);
+                    zipFile.readEntry();
+                  });
                   return;
                 }
+              }
 
-                let readStreamCounter = 0; // Counter to track the number of read streams
-                let readStreamError = null; // Error flag for read streams
-
-                zipFile.openReadStream(entry, (error?: any, readStream?: stream.Readable): void => {
-                  if (error) {
-                    reject(error);
-                    return;
-                  }
-
-                  readStreamCounter++;
-
-                  readStream
-                    .on("error", (error: any): void => {
-                      readStreamError = error;
-                      reject(error);
-                    })
-                    .on("end", (): void => {
-                      readStreamCounter--;
-                      if (readStreamCounter === 0 && !readStreamError) {
-                        // All read streams have completed successfully
-                        resolve();
-                      }
-                    });
-
-                  diffFile.addReadStream(readStream, entry.fileName);
-                });
-
-                zipFile.on("close", (): void => {
-                  if (readStreamCounter === 0) {
-                    // All read streams have completed, no need to wait
-                    if (readStreamError) {
-                      reject(readStreamError);
-                    } else {
-                      diffFile.end();
-                      resolve();
-                    }
-                  }
-                });
-              });
-          });
-        } else {
-          diffFile.end();
-        }
+              zipFile.readEntry();
+            })
+            .on("end", (): void => {
+              if (diff.newOrUpdatedEntries.size > 0) {
+                console.warn(`[generateDiffArchive] Warning: ${diff.newOrUpdatedEntries.size} files in diff were not found in the archive`);
+                for (const [fileName, _] of diff.newOrUpdatedEntries) {
+                  console.warn(`[generateDiffArchive] - Missing file: ${fileName}`);
+                }
+              }
+              
+              console.log(`[generateDiffArchive] Finalizing diff archive`);
+              diffFile.end();
+            })
+            .on("error", (zipErr?: Error): void => {
+              console.error(`[generateDiffArchive] Error processing zip: ${zipErr.message}`);
+              reject(zipErr);
+            });
+        });
       }
     );
   }
@@ -246,52 +284,109 @@ export class PackageDiffer {
     newManifest: PackageManifest,
     newFilePath: string
   ): Promise<DiffBlobInfo> {
+    console.log(`[uploadAndGetDiffBlobInfo] Starting for package ${appPackage.label}, hash: ${appPackage.packageHash}`);
+    
     if (!appPackage || appPackage.packageHash === newPackageHash) {
       // If the packageHash matches, no need to calculate diff, its the same package.
+      console.log(`[uploadAndGetDiffBlobInfo] Skipping - ${!appPackage ? 'no package' : 'same hash'}`);
       return q<DiffBlobInfo>(null);
     }
 
+    console.log(`[uploadAndGetDiffBlobInfo] Getting manifest for package ${appPackage.label}`);
     return this.getManifest(appPackage)
       .then((existingManifest?: PackageManifest) => {
+        console.log(`[uploadAndGetDiffBlobInfo] Got manifest for old package: ${existingManifest ? 'yes' : 'no'}`);
+        if (existingManifest) {
+          const fileCount = Object.keys(existingManifest.toMap() || {}).length;
+          console.log(`[uploadAndGetDiffBlobInfo] Old manifest contains ${fileCount} files`);
+        }
+        
+        console.log(`[uploadAndGetDiffBlobInfo] Generating diff archive`);
         return this.generateDiffArchive(existingManifest, newManifest, newFilePath);
       })
       .then((diffArchiveFilePath?: string): Promise<storageTypes.BlobInfo> => {
+        console.log(`[uploadAndGetDiffBlobInfo] Diff archive generated: ${diffArchiveFilePath ? 'yes' : 'no'}`);
+        
         if (diffArchiveFilePath) {
+          console.log(`[uploadAndGetDiffBlobInfo] Uploading diff archive blob`);
           return this.uploadDiffArchiveBlob(security.generateSecureKey(accountId), diffArchiveFilePath);
         }
 
+        console.log(`[uploadAndGetDiffBlobInfo] No diff archive to upload`);
         return q(<storageTypes.BlobInfo>null);
       })
       .then((blobInfo: storageTypes.BlobInfo) => {
         if (blobInfo) {
+          console.log(`[uploadAndGetDiffBlobInfo] Uploaded blob, size: ${blobInfo.size} bytes`);
           return { packageHash: appPackage.packageHash, blobInfo: blobInfo };
         } else {
+          console.log(`[uploadAndGetDiffBlobInfo] No blob info available`);
           return q<DiffBlobInfo>(null);
         }
+      })
+      .catch((error) => {
+        console.error(`[uploadAndGetDiffBlobInfo] Error: ${error.message || error}`);
+        return null;
       });
   }
 
   private getManifest(appPackage: storageTypes.Package): Promise<PackageManifest> {
     return Promise<PackageManifest>(
       (resolve: (manifest: PackageManifest) => void, reject: (error: any) => void, notify: (progress: any) => void): void => {
+        console.log(`[getManifest] Starting for package ${appPackage?.label || 'unknown'}`);
+        
         if (!appPackage || !appPackage.manifestBlobUrl) {
+          console.log(`[getManifest] No package or manifest URL, returning null`);
           resolve(null);
           return;
         }
 
-        const req: superagent.Request<any> = superagent.get(appPackage.manifestBlobUrl);
-        const writeStream = new stream.Writable();
-        let json = "";
+        console.log(`[getManifest] Downloading manifest from URL: ${appPackage.manifestBlobUrl}`);
+        
+        const req: superagent.Request<any> = superagent
+          .get(appPackage.manifestBlobUrl)
+          .buffer(true)
+          .parse(superagent.parse.text);
 
-        writeStream._write = (data: string | Buffer, encoding: string, callback: Function): void => {
-          json += (<Buffer>data).toString("utf8");
-          callback();
-        };
+        req.end((err, res) => {
+          if (err) {
+            console.error(`[getManifest] Error downloading manifest: ${err.message}`);
+            resolve(null);
+            return;
+          }
 
-        req.pipe(writeStream).on("finish", () => {
-          const manifest: PackageManifest = PackageManifest.deserialize(json);
+          if (!res.text) {
+            console.error(`[getManifest] Manifest download succeeded but no text content received`);
+            console.log(`[getManifest] Response status: ${res.status}, type: ${res.type}, headers:`, res.headers);
+            resolve(null);
+            return;
+          }
 
-          resolve(manifest);
+          try {
+            console.log(`[getManifest] Downloaded manifest (${res.text.length} bytes), content-type: ${res.type}`);
+            console.log(`[getManifest] Manifest first 200 chars: ${res.text.substring(0, 200)}...`);
+            
+            const manifest = PackageManifest.deserialize(res.text);
+            if (manifest) {
+              const fileMap = manifest.toMap();
+              const fileCount = Object.keys(fileMap || {}).length;
+              console.log(`[getManifest] Successfully parsed manifest with ${fileCount} files`);
+              if (fileCount > 0) {
+                const sampleFiles = Object.keys(fileMap).slice(0, 3);
+                console.log(`[getManifest] Sample files: ${sampleFiles.join(', ')}${fileCount > 3 ? '...' : ''}`);
+              } else {
+                console.warn(`[getManifest] Warning: Manifest contains zero files`);
+              }
+            } else {
+              console.error(`[getManifest] Manifest deserialization returned null`);
+            }
+            
+            resolve(manifest);
+          } catch (e) {
+            console.error(`[getManifest] Error parsing manifest: ${e.message}`);
+            console.log(`[getManifest] Raw content that failed parsing: ${res.text.substring(0, 500)}...`);
+            resolve(null);
+          }
         });
       }
     );
@@ -322,32 +417,46 @@ export class PackageDiffer {
     newPackageHash: string,
     newPackageLabel: string
   ): storageTypes.Package[] {
+    console.log(`[getPackagesToDiff] Starting with ${history?.length || 0} packages in history`);
+    console.log(`[getPackagesToDiff] App version: ${appVersion}, new hash: ${newPackageHash}, new label: ${newPackageLabel}`);
+    
     if (!history || !history.length) {
+      console.log(`[getPackagesToDiff] No history available`);
       return null;
     }
 
-    // We assume that the new package has been released and already is in history.
-    // Only pick the packages that are released before the new package to generate diffs.
-    let foundNewPackageInHistory: boolean = false;
-    const validPackages: storageTypes.Package[] = [];
-    for (let i = history.length - 1; i >= 0; i--) {
-      if (!foundNewPackageInHistory) {
-        foundNewPackageInHistory = history[i].label === newPackageLabel;
-        continue;
+    // Only diff with packages of the same app version.
+    // Ignore already processed diffs.
+    const matchingAppVersionPackages: storageTypes.Package[] = history.filter((item: storageTypes.Package) => {
+      const matchingVersion = PackageDiffer.isMatchingAppVersion(item.appVersion, appVersion);
+      const alreadyHasDiff = item.diffPackageMap && item.diffPackageMap[newPackageHash];
+      
+      if (!matchingVersion) {
+        console.log(`[getPackagesToDiff] Skipping package ${item.label} - app version mismatch: ${item.appVersion} vs ${appVersion}`);
       }
+      if (alreadyHasDiff) {
+        console.log(`[getPackagesToDiff] Skipping package ${item.label} - already has diff for hash ${newPackageHash}`);
+      }
+      
+      return matchingVersion && !alreadyHasDiff;
+    });
 
-      if (validPackages.length === this._maxPackagesToDiff) {
-        break;
-      }
+    console.log(`[getPackagesToDiff] Found ${matchingAppVersionPackages.length} packages with matching app version`);
 
-      const isMatchingAppVersion: boolean = PackageDiffer.isMatchingAppVersion(appVersion, history[i].appVersion);
-      if (isMatchingAppVersion && history[i].packageHash !== newPackageHash) {
-        validPackages.push(history[i]);
-      }
+    if (matchingAppVersionPackages.length) {
+      const maxPackagesToDiff = Math.min(this._maxPackagesToDiff, matchingAppVersionPackages.length);
+      const packagesToProcess = matchingAppVersionPackages.slice(0, maxPackagesToDiff);
+      
+      console.log(`[getPackagesToDiff] Will diff against ${packagesToProcess.length} packages (max limit: ${this._maxPackagesToDiff})`);
+      packagesToProcess.forEach(pkg => {
+        console.log(`[getPackagesToDiff] - Package to diff: ${pkg.label}, hash: ${pkg.packageHash}`);
+      });
+      
+      return packagesToProcess;
     }
 
-    // maintain the order of release.
-    return validPackages.reverse();
+    console.log(`[getPackagesToDiff] No suitable packages found for diffing`);
+    return null;
   }
 
   private static generateDiff(oldFileHashes: Map<string, string>, newFileHashes: Map<string, string>): IArchiveDiff {

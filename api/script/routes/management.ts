@@ -1261,54 +1261,75 @@ export function getManagementRouter(config: ManagementConfig): Router {
     appPackage: storageTypes.Package,
     diffPackageMap: storageTypes.PackageHashToBlobInfoMap
   ) {
-    let updateHistory: boolean = false;
-
-    return storage
-      .getApp(accountId, appId)
-      .then((storageApp: storageTypes.App) => {
-        throwIfInvalidPermissions(storageApp, storageTypes.Permissions.Collaborator);
-        return storage.getPackageHistory(accountId, appId, deploymentId);
-      })
-      .then((history: storageTypes.Package[]) => {
-        if (history) {
-          for (let i = history.length - 1; i >= 0; i--) {
-            if (history[i].label === appPackage.label && !history[i].diffPackageMap) {
-              history[i].diffPackageMap = diffPackageMap;
-              updateHistory = true;
+    console.log(`[addDiffInfoForPackage] Starting for package ${appPackage.label}, hash: ${appPackage.packageHash}`);
+    console.log(`[addDiffInfoForPackage] diffPackageMap exists: ${!!diffPackageMap}, entries: ${diffPackageMap ? Object.keys(diffPackageMap).length : 0}`);
+    
+    // Add diff info the package
+    if (diffPackageMap) {
+      return storage
+        .getPackageHistory(accountId, appId, deploymentId)
+        .then((history: storageTypes.Package[]) => {
+          console.log(`[addDiffInfoForPackage] Got history with ${history.length} packages`);
+          
+          // Update the diff info for the current package we deployed
+          for (const updatedPackage of history) {
+            if (updatedPackage.packageHash === appPackage.packageHash) {
+              updatedPackage.diffPackageMap = diffPackageMap;
+              console.log(`[addDiffInfoForPackage] Updated diff package map for package hash: ${updatedPackage.packageHash}`);
               break;
             }
           }
-
-          if (updateHistory) {
-            return storage.updatePackageHistory(accountId, appId, deploymentId, history);
-          }
-        }
-      })
-      .then(() => {
-        if (updateHistory) {
+          
+          console.log(`[addDiffInfoForPackage] Saving updated package history (${history.length} packages)`);
+          return storage.updatePackageHistory(accountId, appId, deploymentId, history);
+        })
+        .then(() => {
+          console.log(`[addDiffInfoForPackage] Successfully updated package history`);
           return storage.getDeployment(accountId, appId, deploymentId).then((deployment: storageTypes.Deployment) => {
+            console.log(`[addDiffInfoForPackage] Invalidating cache for key ${deployment.key}`);
             return invalidateCachedPackage(deployment.key);
           });
-        }
-      })
-      .catch(diffErrorUtils.diffErrorHandler);
+        });
+    } else {
+      console.log(`[addDiffInfoForPackage] No diff package map available, skipping update`);
+      return q(null);
+    }
   }
 
   function processDiff(accountId: string, appId: string, deploymentId: string, appPackage: storageTypes.Package): q.Promise<void> {
+    console.log(`[processDiff] Starting for package ${appPackage.label}, manifestBlobUrl exists: ${!!appPackage.manifestBlobUrl}`);
+    console.log(`[processDiff] ENABLE_PACKAGE_DIFFING env var: ${process.env.ENABLE_PACKAGE_DIFFING}`);
+    
     if (!appPackage.manifestBlobUrl || process.env.ENABLE_PACKAGE_DIFFING) {
       // No need to process diff because either:
       //   1. The release just contains a single file.
       //   2. Diffing disabled.
+      console.log(`[processDiff] Skipping diff generation: ${!appPackage.manifestBlobUrl ? 'No manifest URL' : 'Diffing disabled by env var'}`);
       return q(<void>null);
     }
 
-    console.log(`Processing package: ${appPackage.label}`);
+    console.log(`[processDiff] Processing package: ${appPackage.label}, hash: ${appPackage.packageHash}`);
 
     return packageDiffing
       .generateDiffPackageMap(accountId, appId, deploymentId, appPackage)
       .then((diffPackageMap: storageTypes.PackageHashToBlobInfoMap) => {
-        console.log(`Package processed, adding diff info`);
-        addDiffInfoForPackage(accountId, appId, deploymentId, appPackage, diffPackageMap);
+        console.log(`[processDiff] Package processed, diffPackageMap exists: ${!!diffPackageMap}`);
+        if (diffPackageMap) {
+          console.log(`[processDiff] diffPackageMap has ${Object.keys(diffPackageMap).length} entries`);
+          Object.keys(diffPackageMap).forEach(key => {
+            console.log(`[processDiff] - Entry: ${key}, size: ${diffPackageMap[key].size} bytes`);
+          });
+        }
+        
+        console.log(`[processDiff] Adding diff info to package`);
+        return addDiffInfoForPackage(accountId, appId, deploymentId, appPackage, diffPackageMap);
+      })
+      .then(() => {
+        console.log(`[processDiff] Successfully completed diff processing`);
+      })
+      .catch((error) => {
+        console.error(`[processDiff] Error during diff processing: ${error.message || error}`);
+        return diffErrorUtils.diffErrorHandler(error);
       });
   }
 
