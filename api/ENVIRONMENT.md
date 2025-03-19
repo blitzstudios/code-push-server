@@ -75,6 +75,7 @@ To perform the unit tests against an Azure server:
 To enable generating diffs for releases:
 
 - `ENABLE_PACKAGE_DIFFING`: Set to 'true'
+- `DIFF_PACKAGE_COUNT`: Set to the number of releases to generate diffs for. Defaults to 5 if unspecified.
 
 To enable KeyVault credential resolution, set:
 
