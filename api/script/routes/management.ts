@@ -1300,7 +1300,7 @@ export function getManagementRouter(config: ManagementConfig): Router {
     console.log(`[processDiff] Starting for package ${appPackage.label}, manifestBlobUrl exists: ${!!appPackage.manifestBlobUrl}`);
     console.log(`[processDiff] ENABLE_PACKAGE_DIFFING env var: ${process.env.ENABLE_PACKAGE_DIFFING}`);
     
-    if (!appPackage.manifestBlobUrl || process.env.ENABLE_PACKAGE_DIFFING) {
+    if (!appPackage.manifestBlobUrl || !process.env.ENABLE_PACKAGE_DIFFING) {
       // No need to process diff because either:
       //   1. The release just contains a single file.
       //   2. Diffing disabled.

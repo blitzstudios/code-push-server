@@ -444,8 +444,13 @@ export class PackageDiffer {
     console.log(`[getPackagesToDiff] Found ${matchingAppVersionPackages.length} packages with matching app version`);
 
     if (matchingAppVersionPackages.length) {
-      const maxPackagesToDiff = Math.min(this._maxPackagesToDiff, matchingAppVersionPackages.length);
-      const packagesToProcess = matchingAppVersionPackages.slice(0, maxPackagesToDiff);
+      // Sort packages by uploadTime in descending order to get newest packages first
+      const sortedPackages = matchingAppVersionPackages.sort((a, b) => {
+        return b.uploadTime - a.uploadTime;
+      });
+      
+      const maxPackagesToDiff = Math.min(this._maxPackagesToDiff, sortedPackages.length);
+      const packagesToProcess = sortedPackages.slice(0, maxPackagesToDiff);
       
       console.log(`[getPackagesToDiff] Will diff against ${packagesToProcess.length} packages (max limit: ${this._maxPackagesToDiff})`);
       packagesToProcess.forEach(pkg => {
