@@ -722,9 +722,9 @@ export function getManagementRouter(config: ManagementConfig): Router {
         const newRolloutValue: number = info.rollout;
         if (validationUtils.isDefined(newRolloutValue)) {
           let errorMessage: string;
-          if (!isUnfinishedRollout(packageToUpdate.rollout)) {
+          if (!isUnfinishedRollout(packageToUpdate.rollout) && newRolloutValue !== 100) {
             errorMessage = "Cannot update rollout value for a completed rollout release.";
-          } else if (packageToUpdate.rollout >= newRolloutValue) {
+          } else if (packageToUpdate.rollout > newRolloutValue) {
             errorMessage = `Rollout value must be greater than "${packageToUpdate.rollout}", the existing value.`;
           }
 
