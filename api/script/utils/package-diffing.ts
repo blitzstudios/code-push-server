@@ -32,7 +32,6 @@ interface DiffBlobInfo {
 export class PackageDiffer {
   private static MANIFEST_FILE_NAME: string = "hotcodepush.json";
   private static WORK_DIRECTORY_PATH: string = env.getTempDirectory();
-  private static IS_WORK_DIRECTORY_CREATED: boolean = false;
 
   private _storage: storageTypes.Storage;
   private _maxPackagesToDiff: number;
@@ -502,13 +501,8 @@ export class PackageDiffer {
   }
 
   private static ensureWorkDirectoryExists(): void {
-    if (!PackageDiffer.IS_WORK_DIRECTORY_CREATED) {
-      if (!fs.existsSync(PackageDiffer.WORK_DIRECTORY_PATH)) {
-        fs.mkdirSync(PackageDiffer.WORK_DIRECTORY_PATH);
-      }
-
-      // Memoize this check to avoid unnecessary file system access.
-      PackageDiffer.IS_WORK_DIRECTORY_CREATED = true;
+    if (!fs.existsSync(PackageDiffer.WORK_DIRECTORY_PATH)) {
+      fs.mkdirSync(PackageDiffer.WORK_DIRECTORY_PATH);
     }
   }
 
