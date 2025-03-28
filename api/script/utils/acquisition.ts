@@ -5,6 +5,27 @@ import * as semver from "semver";
 import { UpdateCheckCacheResponse, UpdateCheckRequest, UpdateCheckResponse } from "../types/rest-definitions";
 import { Package } from "../storage/storage";
 import { isUnfinishedRollout } from "./rollout-selector";
+import * as env from "../environment";
+import * as URL from "url";
+
+function proxyBlobUrl(azureUrl: string): string {
+  try {
+    const proxyUrl = env.getUpdateCheckProxyUrl();
+    if (!proxyUrl) {
+      return azureUrl;
+    }
+
+    const parsedUrl = new URL.URL(azureUrl);
+    const newUrl = new URL.URL(proxyUrl);
+    newUrl.pathname = parsedUrl.pathname;
+    newUrl.search = parsedUrl.search;
+
+    return newUrl.toString();
+  } catch (error) {
+    console.warn('Failed to proxy blob URL:', error);
+    return azureUrl;
+  }
+}
 
 interface UpdatePackage {
   response: UpdateCheckResponse;
@@ -114,10 +135,10 @@ function getUpdatePackage(packageHistory: Package[], request: UpdateCheckRequest
     latestSatisfyingEnabledPackage.diffPackageMap &&
     latestSatisfyingEnabledPackage.diffPackageMap[request.packageHash]
   ) {
-    updateDetails.downloadURL = latestSatisfyingEnabledPackage.diffPackageMap[request.packageHash].url;
+    updateDetails.downloadURL = proxyBlobUrl(latestSatisfyingEnabledPackage.diffPackageMap[request.packageHash].url);
     updateDetails.packageSize = latestSatisfyingEnabledPackage.diffPackageMap[request.packageHash].size;
   } else {
-    updateDetails.downloadURL = latestSatisfyingEnabledPackage.blobUrl;
+    updateDetails.downloadURL = proxyBlobUrl(latestSatisfyingEnabledPackage.blobUrl);
     updateDetails.packageSize = latestSatisfyingEnabledPackage.size;
   }
 
