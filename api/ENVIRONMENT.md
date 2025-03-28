@@ -84,6 +84,6 @@ To enable KeyVault credential resolution, set:
 - `CERTIFICATE_THUMBPRINT`: The thumbprint of the certificate associated with your Active Directory app (for which a .pfx has been uploaded to your certificate store)
 - `REFRESH_CREDENTIALS_INTERVAL` (Optional): The frequency, in milliseconds, to re-retrieve credentials from Key Vault (defaults to one day, currently only storage keys are supported)
 
-To proxy update check URLs through a CDN or proxy service:
+To proxy update check URLs through a caching or proxy service:
 
 - `UPDATE_CHECK_PROXY_URL`: The base URL to use for proxying update check responses. For example, if set to "https://yourcdn.com/" Azure blob storage URLs will be transformed to use this domain instead.
