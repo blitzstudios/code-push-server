@@ -42,9 +42,9 @@ export function getFileWithField(req: Express.Request, field: string): Express.M
   return null;
 }
 
-export function createTempFileFromBuffer(buffer: Buffer): string {
+export function createTempFileFromBuffer(buffer: Buffer, suffix?: string): string {
   const tmpPath = require("os").tmpdir();
-  const tmpFilePath = require("path").join(tmpPath, "tempfile");
+  const tmpFilePath = require("path").join(tmpPath, `tempfile${suffix ? `_${suffix}` : ""}`);
   require("fs").writeFileSync(tmpFilePath, buffer);
   return tmpFilePath;
 }

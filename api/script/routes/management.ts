@@ -780,7 +780,7 @@ export function getManagementRouter(config: ManagementConfig): Router {
       return;
     }
 
-    const filePath: string = createTempFileFromBuffer(file.buffer);
+    const filePath: string = createTempFileFromBuffer(file.buffer, `${appName}_${deploymentName}`);
     const restPackage: restTypes.Package = tryJSON(req.body.packageInfo) || {};
     const validationErrors: validationUtils.ValidationError[] = validationUtils.validatePackageInfo(
       restPackage,
