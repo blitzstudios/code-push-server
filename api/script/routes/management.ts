@@ -860,7 +860,7 @@ export function getManagementRouter(config: ManagementConfig): Router {
             const json: string = newManifest.serialize();
             const readStream: stream.Readable = streamifier.createReadStream(json);
 
-            return storage.addBlob(security.generateSecureKey(accountId), readStream, json.length, "application/json");
+            return storage.addBlob(security.generateSecureKey(accountId), readStream, json.length);
           }
 
           return q(<string>null);

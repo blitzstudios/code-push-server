@@ -691,15 +691,13 @@ export class AzureStorage implements storage.Storage {
       .catch(AzureStorage.azureErrorHandler);
   }
 
-  public addBlob(blobId: string, stream: stream.Readable, streamLength: number, contentType?: string): q.Promise<string> {
+  public addBlob(blobId: string, stream: stream.Readable, streamLength: number): q.Promise<string> {
     return this._setupPromise
       .then(() => {
         return utils.streamToBuffer(stream);
       })
       .then((buffer) => {
-        // Add content type if specified
-        const options = contentType ? { blobHTTPHeaders: { blobContentType: contentType } } : undefined;
-        return this._blobService.getContainerClient(AzureStorage.TABLE_NAME).uploadBlockBlob(blobId, buffer, buffer.byteLength, options);
+        return this._blobService.getContainerClient(AzureStorage.TABLE_NAME).uploadBlockBlob(blobId, buffer, buffer.byteLength);
       })
       .then(() => {
         return blobId;
