@@ -142,18 +142,12 @@ export class PackageDiffer {
                 reject(error);
               })
               .on("entry", (entry: yauzl.IEntry): void => {
-                if (
-                  !PackageDiffer.isEntryInMap(entry.fileName, /*hash*/ null, diff.newOrUpdatedEntries, /*requireContentMatch*/ false)
-                ) {
+                if (!PackageDiffer.isEntryInMap(entry.fileName, /*hash*/ null, diff.newOrUpdatedEntries, /*requireContentMatch*/ false)) {
                   return;
                 } else if (/\/$/.test(entry.fileName)) {
-                  // this is a directory
                   diffFile.addEmptyDirectory(entry.fileName);
                   return;
                 }
-
-                let readStreamCounter = 0; // Counter to track the number of read streams
-                let readStreamError = null; // Error flag for read streams
 
                 zipFile.openReadStream(entry, (error?: any, readStream?: stream.Readable): void => {
                   if (error) {
@@ -161,35 +155,11 @@ export class PackageDiffer {
                     return;
                   }
 
-                  readStreamCounter++;
-
-                  readStream
-                    .on("error", (error: any): void => {
-                      readStreamError = error;
-                      reject(error);
-                    })
-                    .on("end", (): void => {
-                      readStreamCounter--;
-                      if (readStreamCounter === 0 && !readStreamError) {
-                        // All read streams have completed successfully
-                        resolve(diffFilePath);
-                      }
-                    });
-
                   diffFile.addReadStream(readStream, entry.fileName);
                 });
-
-                zipFile.on("close", (): void => {
-                  if (readStreamCounter === 0) {
-                    // All read streams have completed, no need to wait
-                    if (readStreamError) {
-                      reject(readStreamError);
-                    } else {
-                      resolve(diffFilePath);
-                      diffFile.end();
-                    }
-                  }
-                });
+              })
+              .on("close", (): void => {
+                diffFile.end();
               });
           });
         } else {
@@ -272,26 +242,35 @@ export class PackageDiffer {
   }
 
   private getManifest(appPackage: storageTypes.Package): Promise<PackageManifest> {
-    return Promise<PackageManifest>(
+    return Promise(
       (resolve: (manifest: PackageManifest) => void, reject: (error: any) => void, notify: (progress: any) => void): void => {
         if (!appPackage || !appPackage.manifestBlobUrl) {
           resolve(null);
           return;
         }
 
-        const req: superagent.Request<any> = superagent.get(appPackage.manifestBlobUrl);
-        const writeStream = new stream.Writable();
-        let json = "";
+        const req: superagent.Request = superagent
+          .get(appPackage.manifestBlobUrl)
+          .buffer(true)
+          .parse(superagent.parse.text);
 
-        writeStream._write = (data: string | Buffer, encoding: string, callback: Function): void => {
-          json += (<Buffer>data).toString("utf8");
-          callback();
-        };
+        req.end((err, res) => {
+          if (err) {
+            resolve(null);
+            return;
+          }
 
-        req.pipe(writeStream).on("finish", () => {
-          const manifest: PackageManifest = PackageManifest.deserialize(json);
+          if (!res.text) {
+            resolve(null);
+            return;
+          }
 
-          resolve(manifest);
+          try {
+            const manifest = PackageManifest.deserialize(res.text);
+            resolve(manifest);
+          } catch (e) {
+            resolve(null);
+          }
         });
       }
     );
