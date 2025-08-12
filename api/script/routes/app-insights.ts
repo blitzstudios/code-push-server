@@ -104,9 +104,14 @@ export class AppInsights {
   constructor() {
     if (INSTRUMENTATION_KEY) {
       ApplicationInsights.setup(INSTRUMENTATION_KEY)
+        .setAutoDependencyCorrelation(true)
+        // We manually track requests below to add CodePush-specific tags and ensure correct duration on finish
         .setAutoCollectRequests(false)
-        .setAutoCollectPerformance(false)
+        .setAutoCollectPerformance(true)
         .setAutoCollectExceptions(true)
+        .setAutoCollectDependencies(true)
+        .setAutoCollectConsole(true, true)
+        .setUseDiskRetryCaching(true)
         .start();
     }
   }
@@ -227,16 +232,18 @@ export class AppInsights {
         tagProperties[AppInsights.ORIGIN_TAG] = "Unknown";
       }
 
-      ApplicationInsights.defaultClient.trackRequest({
-        name: req.path,
-        url: req.originalUrl,
-        duration: new Date().getTime() - reqStart,
-        resultCode: res.statusCode,
-        success: res.statusCode >= 200 && res.statusCode <= 299,
-      });
-
       if (res && res.once) {
         res.once("finish", (): void => {
+          // Track the request only after the response finishes to capture accurate status and duration
+          const durationMs = new Date().getTime() - reqStart;
+          ApplicationInsights.defaultClient.trackRequest({
+            name: `${req.method} ${req.path}`,
+            url: req.originalUrl,
+            duration: durationMs,
+            resultCode: res.statusCode,
+            success: res.statusCode >= 200 && res.statusCode <= 299,
+          });
+
           let eventProperties: any;
           if (req.user && req.user.id) {
             eventProperties = { url: req.url, method: req.method, statusCode: res.statusCode.toString() };
@@ -282,13 +289,13 @@ export class AppInsights {
   }
 
   public trackEvent(event: string, properties?: any): void {
-    if (AppInsights.isAppInsightsInstrumented) {
+    if (AppInsights.isAppInsightsInstrumented()) {
       ApplicationInsights.defaultClient.trackEvent({ name: event, properties });
     }
   }
 
   public trackException(err: any, info?: any): void {
-    if (err && AppInsights.isAppInsightsInstrumented) {
+    if (err && AppInsights.isAppInsightsInstrumented()) {
       ApplicationInsights.defaultClient.trackException({ exception: err, measurements: info });
     }
   }
