@@ -113,6 +113,16 @@ export class AppInsights {
         .setAutoCollectConsole(true, true)
         .setUseDiskRetryCaching(true)
         .start();
+
+      process.on("uncaughtException", (err: any) => {
+        if (err) {
+          ApplicationInsights.defaultClient.trackException({ exception: err });
+        }
+      });
+      process.on("unhandledRejection", (reason: any) => {
+        const error = reason instanceof Error ? reason : new Error(typeof reason === "string" ? reason : JSON.stringify(reason));
+        ApplicationInsights.defaultClient.trackException({ exception: error });
+      });
     }
   }
 
