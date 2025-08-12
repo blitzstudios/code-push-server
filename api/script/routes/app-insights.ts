@@ -242,6 +242,7 @@ export class AppInsights {
             duration: durationMs,
             resultCode: res.statusCode,
             success: res.statusCode >= 200 && res.statusCode <= 299,
+            properties: tagProperties,
           });
 
           let eventProperties: any;
