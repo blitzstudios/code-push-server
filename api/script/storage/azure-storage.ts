@@ -896,17 +896,38 @@ export class AzureStorage implements storage.Storage {
 
     return q
       .all([
-        tableServiceClient.createTable(AzureStorage.TABLE_NAME),
-        blobServiceClient.createContainer(AzureStorage.TABLE_NAME, { access: "blob" }),
-        blobServiceClient.createContainer(AzureStorage.HISTORY_BLOB_CONTAINER_NAME),
+        // Create table if it doesn't exist; ignore AlreadyExists (code or 409)
+        tableServiceClient.createTable(AzureStorage.TABLE_NAME).catch((error: any) => {
+          if (error && !(error.code === "TableAlreadyExists" || error.statusCode === 409)) {
+            throw error;
+          }
+        }),
+        // Create containers idempotently
+        blobServiceClient.getContainerClient(AzureStorage.TABLE_NAME).createIfNotExists({ access: "blob" }),
+        blobServiceClient.getContainerClient(AzureStorage.HISTORY_BLOB_CONTAINER_NAME).createIfNotExists(),
       ])
       .then(() => {
         return q.all<any>([
-          tableClient.createEntity(tableHealthEntity),
-          blobServiceClient.getContainerClient(AzureStorage.TABLE_NAME).uploadBlockBlob("health", "health", "health".length),
+          // Upsert table health entity to avoid 409s when multiple instances race
+          tableClient.upsertEntity(tableHealthEntity, "Merge"),
+          // Upload health blobs only if they don't exist
+          blobServiceClient
+            .getContainerClient(AzureStorage.TABLE_NAME)
+            .uploadBlockBlob("health", "health", "health".length, { conditions: { ifNoneMatch: "*" } })
+            .catch((error: any) => {
+              // If blob exists (precondition failed), ignore; otherwise rethrow
+              if (!(error && (error.statusCode === 412 || error.code === "BlobAlreadyExists"))) {
+                throw error;
+              }
+            }),
           blobServiceClient
             .getContainerClient(AzureStorage.HISTORY_BLOB_CONTAINER_NAME)
-            .uploadBlockBlob("health", "health", "health".length),
+            .uploadBlockBlob("health", "health", "health".length, { conditions: { ifNoneMatch: "*" } })
+            .catch((error: any) => {
+              if (!(error && (error.statusCode === 412 || error.code === "BlobAlreadyExists"))) {
+                throw error;
+              }
+            }),
         ]);
       })
       .then(() => {
@@ -914,14 +935,6 @@ export class AzureStorage implements storage.Storage {
         // the initialized services
         this._tableClient = tableClient;
         this._blobService = blobServiceClient;
-      })
-      .catch((error) => {
-        if (error.code == "ContainerAlreadyExists") {
-          this._tableClient = tableClient;
-          this._blobService = blobServiceClient;
-        } else {
-          throw error;
-        }
       });
   }
 
