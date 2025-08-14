@@ -282,12 +282,16 @@ export function getAcquisitionRouter(config: AcquisitionConfig): express.Router 
         "A download status report must contain a valid deploymentKey and package label."
       );
     }
-    return redisManager
+    // Respond immediately to avoid blocking on Redis under burst traffic
+    res.sendStatus(200);
+
+    // Fire-and-forget metrics update; do not route errors to middleware to avoid
+    // surfacing as request exceptions after the response has been sent.
+    redisManager
       .incrementLabelStatusCount(deploymentKey, req.body.label, redis.DOWNLOADED)
-      .then(() => {
-        res.sendStatus(200);
+      .catch((error: any) => {
+        console.warn("Failed to record download metric", error);
       })
-      .catch((error: any) => errorUtils.sendUnknownError(res, error, next))
       .done();
   };
 
