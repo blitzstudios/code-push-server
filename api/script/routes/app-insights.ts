@@ -305,9 +305,14 @@ export class AppInsights {
     }
   }
 
-  public trackException(err: any, info?: any): void {
-    if (err && AppInsights.isAppInsightsInstrumented()) {
-      ApplicationInsights.defaultClient.trackException({ exception: err, measurements: info });
+  public trackException(err: any, info?: Record<string, string | number>): void {
+    if (AppInsights.isAppInsightsInstrumented()) {
+      const properties: Record<string, string> = {};
+      const measurements: Record<string, number> = {};
+      for (const [k, v] of Object.entries(info ?? {})) {
+        typeof v === "number" ? (measurements[k] = v) : (properties[k] = String(v));
+      }
+      ApplicationInsights.defaultClient.trackException({ exception: err, properties, measurements });
     }
   }
 

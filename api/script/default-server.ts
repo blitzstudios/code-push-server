@@ -164,7 +164,7 @@ export function start(done: (err?: any, server?: express.Express, storage?: Stor
       }
 
       // Error handler needs to be the last middleware so that it can catch all unhandled exceptions
-      app.use(appInsights.errorHandler);
+      app.use(appInsights.errorHandler.bind(appInsights));
 
       if (isKeyVaultConfigured) {
         // Refresh credentials from the vault regularly as the key is rotated
