@@ -148,9 +148,11 @@ export function getAcquisitionRouter(config: AcquisitionConfig): express.Router 
       const url: string = getUrlKey(req.originalUrl);
       let fromCache: boolean = true;
       let redisError: Error;
+      const REDIS_GET_TIMEOUT_MS = 100;
 
       redisManager
         .getCachedResponse(key, url)
+        .timeout(REDIS_GET_TIMEOUT_MS)
         .catch((error: Error) => {
           // Store the redis error to be thrown after we send response.
           redisError = error;
@@ -189,12 +191,14 @@ export function getAcquisitionRouter(config: AcquisitionConfig): express.Router 
 
           // Update REDIS cache after sending the response so that we don't block the request.
           if (!fromCache) {
-            return redisManager.setCachedResponse(key, url, response);
+            return redisManager.setCachedResponse(key, url, response).catch((error: any) => {
+              console.warn("Failed to set updateCheck cache", error);
+            });
           }
         })
         .then(() => {
           if (redisError) {
-            throw redisError;
+            console.warn("Redis cache error in updateCheck", redisError);
           }
         })
         .catch((error: storageTypes.StorageError) => errorUtils.restErrorHandler(res, error, next))
@@ -221,6 +225,9 @@ export function getAcquisitionRouter(config: AcquisitionConfig): express.Router 
 
     const sdkVersion: string = restHeaders.getSdkVersion(req);
     if (semver.valid(sdkVersion) && semver.gte(sdkVersion, METRICS_BREAKING_VERSION)) {
+      // Respond immediately; perform metrics updates asynchronously to avoid blocking under burst traffic
+      res.sendStatus(200);
+
       // If previousDeploymentKey not provided, assume it is the same deployment key.
       let redisUpdatePromise: q.Promise<void>;
 
@@ -238,12 +245,13 @@ export function getAcquisitionRouter(config: AcquisitionConfig): express.Router 
 
       redisUpdatePromise
         .then(() => {
-          res.sendStatus(200);
           if (clientUniqueId) {
-            redisManager.removeDeploymentKeyClientActiveLabel(previousDeploymentKey, clientUniqueId);
+            return redisManager.removeDeploymentKeyClientActiveLabel(previousDeploymentKey, clientUniqueId);
           }
         })
-        .catch((error: any) => errorUtils.sendUnknownError(res, error, next))
+        .catch((error: any) => {
+          console.warn("Failed to record deploy metric", error);
+        })
         .done();
     } else {
       if (!clientUniqueId) {
@@ -253,7 +261,10 @@ export function getAcquisitionRouter(config: AcquisitionConfig): express.Router 
         );
       }
 
-      return redisManager
+      // Respond immediately; perform legacy SDK metrics updates asynchronously
+      res.sendStatus(200);
+
+      redisManager
         .getCurrentActiveLabel(deploymentKey, clientUniqueId)
         .then((currentVersionLabel: string) => {
           if (req.body.label && req.body.label !== currentVersionLabel) {
@@ -266,10 +277,9 @@ export function getAcquisitionRouter(config: AcquisitionConfig): express.Router 
             return redisManager.updateActiveAppForClient(deploymentKey, clientUniqueId, appVersion, appVersion);
           }
         })
-        .then(() => {
-          res.sendStatus(200);
+        .catch((error: any) => {
+          console.warn("Failed to record legacy deploy metric", error);
         })
-        .catch((error: any) => errorUtils.sendUnknownError(res, error, next))
         .done();
     }
   };
