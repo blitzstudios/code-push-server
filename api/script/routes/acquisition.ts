@@ -18,8 +18,14 @@ import * as q from "q";
 import * as queryString from "querystring";
 import * as URL from "url";
 import Promise = q.Promise;
+import { Microcache } from "../utils/microcache";
 
 const METRICS_BREAKING_VERSION = "1.5.2-beta";
+
+// Small per-process microcache to smooth burst traffic for updateCheck.
+// Holds the fully cacheable response object for a short time window.
+const UPDATECHECK_MEM_TTL_MS: number = Number(process.env.UPDATECHECK_MEM_TTL_MS) || 30000;
+const updateCheckMicrocache = new Microcache<redis.CacheableResponse>(UPDATECHECK_MEM_TTL_MS);
 
 export interface AcquisitionConfig {
   storage: storageTypes.Storage;
@@ -114,6 +120,32 @@ function createResponseUsingStorage(
   }
 }
 
+function buildUpdateCheckBody(
+  response: redis.CacheableResponse,
+  clientUniqueId: string
+): { updateInfo: UpdateCheckResponse } {
+  const cachedResponseObject = <UpdateCheckCacheResponse>response.body;
+  let giveRolloutPackage: boolean = false;
+  if (cachedResponseObject.rolloutPackage && clientUniqueId) {
+    const releaseSpecificString: string =
+      cachedResponseObject.rolloutPackage.label || cachedResponseObject.rolloutPackage.packageHash;
+    giveRolloutPackage = rolloutSelector.isSelectedForRollout(
+      clientUniqueId,
+      cachedResponseObject.rollout,
+      releaseSpecificString
+    );
+  }
+
+  const updateCheckBody: { updateInfo: UpdateCheckResponse } = {
+    updateInfo: giveRolloutPackage ? cachedResponseObject.rolloutPackage : cachedResponseObject.originalPackage,
+  };
+
+  // Change in new API
+  updateCheckBody.updateInfo.target_binary_range = updateCheckBody.updateInfo.appVersion;
+
+  return updateCheckBody;
+}
+
 export function getHealthRouter(config: AcquisitionConfig): express.Router {
   const storage: storageTypes.Storage = config.storage;
   const redisManager: redis.RedisManager = config.redisManager;
@@ -146,8 +178,18 @@ export function getAcquisitionRouter(config: AcquisitionConfig): express.Router 
       const key: string = redis.Utilities.getDeploymentKeyHash(deploymentKey);
       const clientUniqueId: string = String(req.query.clientUniqueId || req.query.client_unique_id);
       const url: string = getUrlKey(req.originalUrl);
+      const memCacheKey: string = key + "|" + url;
       let fromCache: boolean = true;
       let redisError: Error;
+
+      const memValue = updateCheckMicrocache.get(memCacheKey);
+      if (memValue) {
+        const updateCheckBody = buildUpdateCheckBody(memValue, clientUniqueId);
+        res.locals.fromCache = true;
+        res.status(memValue.statusCode).send(newApi ? utils.convertObjectToSnakeCase(updateCheckBody) : updateCheckBody);
+        return;
+      }
+
       redisManager
         .getCachedResponse(key, url)
         .catch((error: Error) => {
@@ -164,29 +206,12 @@ export function getAcquisitionRouter(config: AcquisitionConfig): express.Router 
             return q<void>(null);
           }
 
-          let giveRolloutPackage: boolean = false;
-          const cachedResponseObject = <UpdateCheckCacheResponse>response.body;
-          if (cachedResponseObject.rolloutPackage && clientUniqueId) {
-            const releaseSpecificString: string =
-              cachedResponseObject.rolloutPackage.label || cachedResponseObject.rolloutPackage.packageHash;
-            giveRolloutPackage = rolloutSelector.isSelectedForRollout(
-              clientUniqueId,
-              cachedResponseObject.rollout,
-              releaseSpecificString
-            );
-          }
-
-          const updateCheckBody: { updateInfo: UpdateCheckResponse } = {
-            updateInfo: giveRolloutPackage ? cachedResponseObject.rolloutPackage : cachedResponseObject.originalPackage,
-          };
-
-          // Change in new API
-          updateCheckBody.updateInfo.target_binary_range = updateCheckBody.updateInfo.appVersion;
+          const updateCheckBody = buildUpdateCheckBody(response, clientUniqueId);
 
           res.locals.fromCache = fromCache;
           res.status(response.statusCode).send(newApi ? utils.convertObjectToSnakeCase(updateCheckBody) : updateCheckBody);
 
-          // Update REDIS cache after sending the response so that we don't block the request.
+          updateCheckMicrocache.set(memCacheKey, response);
           if (!fromCache) {
             return redisManager.setCachedResponse(key, url, response).catch((error: any) => {
               console.warn("Failed to set updateCheck cache", error);
