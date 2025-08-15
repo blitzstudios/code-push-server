@@ -148,11 +148,8 @@ export function getAcquisitionRouter(config: AcquisitionConfig): express.Router 
       const url: string = getUrlKey(req.originalUrl);
       let fromCache: boolean = true;
       let redisError: Error;
-      const REDIS_GET_TIMEOUT_MS = 100;
-
       redisManager
         .getCachedResponse(key, url)
-        .timeout(REDIS_GET_TIMEOUT_MS)
         .catch((error: Error) => {
           // Store the redis error to be thrown after we send response.
           redisError = error;
