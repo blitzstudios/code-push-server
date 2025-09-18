@@ -112,7 +112,10 @@ export class AppInsights {
         .setAutoCollectDependencies(true)
         .setAutoCollectConsole(true, true)
         .setUseDiskRetryCaching(true)
-        .start();
+
+      ApplicationInsights.defaultClient.config.samplingPercentage = 10;
+      
+      ApplicationInsights.start();
 
       process.on("uncaughtException", (err: any) => {
         if (err) {
