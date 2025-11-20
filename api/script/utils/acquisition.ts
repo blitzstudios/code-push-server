@@ -30,6 +30,9 @@ function proxyBlobUrl(azureUrl: string): string {
 interface UpdatePackage {
   response: UpdateCheckResponse;
   rollout?: number;
+  holdDurationMinutes?: number;
+  rampDurationMinutes?: number;
+  uploadTime?: number;
 }
 
 export function getUpdatePackageInfo(packageHistory: Package[], request: UpdateCheckRequest): UpdateCheckCacheResponse {
@@ -42,6 +45,9 @@ export function getUpdatePackageInfo(packageHistory: Package[], request: UpdateC
       originalPackage: origUpdatePackage.response,
       rolloutPackage: updatePackage.response,
       rollout: updatePackage.rollout,
+      rolloutHoldDurationMinutes: updatePackage.holdDurationMinutes,
+      rolloutRampDurationMinutes: updatePackage.rampDurationMinutes,
+      rolloutUploadTime: updatePackage.uploadTime,
     };
   } else {
     cacheResponse = { originalPackage: updatePackage.response };
@@ -152,5 +158,11 @@ function getUpdatePackage(packageHistory: Package[], request: UpdateCheckRequest
   // Old plugins will only work with updates with app versions that are valid semver
   // (i.e. not a range), so we return the same version string as the requested one
   updateDetails.appVersion = request.appVersion;
-  return { response: updateDetails, rollout: rollout };
+  return {
+    response: updateDetails,
+    rollout: rollout,
+    holdDurationMinutes: latestSatisfyingEnabledPackage.holdDurationMinutes,
+    rampDurationMinutes: latestSatisfyingEnabledPackage.rampDurationMinutes,
+    uploadTime: latestSatisfyingEnabledPackage.uploadTime,
+  };
 }

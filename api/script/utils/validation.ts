@@ -35,6 +35,10 @@ module Validation {
     return typeof val === "boolean";
   }
 
+  function isValidNonNegativeIntegerField(val: any): boolean {
+    return Number.isInteger(val) && val >= 0;
+  }
+
   function isValidLabelField(val: any): boolean {
     return val && val.match(/^v[1-9][0-9]*$/) !== null; //validates if label field confirms to 'v1-v9999...' standard
   }
@@ -71,8 +75,8 @@ module Validation {
   }
 
   export function isValidRolloutField(rollout: any): boolean {
-    // rollout is an optional field, or when defined should be a number between 1-100.
-    return /^(100|[1-9][0-9]|[1-9])$/.test(rollout);
+    // rollout is optional, but when defined should be a number between 0-100, inclusive.
+    return /^([0-9]|[1-9][0-9]|100)$/.test(rollout);
   }
 
   const isValidDescriptionField = getStringValidator(/*maxLength=*/ 10000);
@@ -165,6 +169,8 @@ module Validation {
       isDisabled: isValidBooleanField,
       isMandatory: isValidBooleanField,
       rollout: isValidRolloutField,
+      holdDurationMinutes: isValidNonNegativeIntegerField,
+      rampDurationMinutes: isValidNonNegativeIntegerField,
     };
 
     let requiredFields: string[] = [];

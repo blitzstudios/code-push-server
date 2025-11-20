@@ -52,6 +52,8 @@ export interface PackageInfo {
   /*generated*/ label?: string;
   /*generated*/ packageHash?: string;
   rollout?: number;
+  holdDurationMinutes?: number;
+  rampDurationMinutes?: number;
 }
 
 /*out*/
@@ -69,6 +71,9 @@ export interface UpdateCheckCacheResponse {
   originalPackage: UpdateCheckResponse;
   rollout?: number;
   rolloutPackage?: UpdateCheckResponse;
+  rolloutHoldDurationMinutes?: number;
+  rolloutRampDurationMinutes?: number;
+  rolloutUploadTime?: number;
 }
 
 /*in*/
@@ -77,6 +82,7 @@ export interface UpdateCheckRequest {
   clientUniqueId?: string;
   deploymentKey: string;
   isCompanion?: boolean;
+  beta?: boolean;
   label?: string;
   packageHash?: string;
 }

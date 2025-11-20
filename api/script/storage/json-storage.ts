@@ -480,6 +480,8 @@ export class JsonStorage implements storage.Storage {
     const lastPackage: storage.Package = history.length ? history[history.length - 1] : null;
     if (lastPackage) {
       lastPackage.rollout = null;
+      lastPackage.holdDurationMinutes = null;
+      lastPackage.rampDurationMinutes = null;
     }
 
     deployment.packageHistory.push(appPackage);
