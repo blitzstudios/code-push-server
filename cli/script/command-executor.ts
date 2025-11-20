@@ -812,7 +812,9 @@ function getPackageString(packageObject: Package): string {
 function getPackageMetricsString(obj: Package): string {
   const packageObject = <PackageWithMetrics>obj;
   const rolloutString: string =
-    obj && obj.rollout && obj.rollout !== 100 ? `\n${chalk.green("Rollout:")} ${obj.rollout.toLocaleString()}%` : "";
+    obj && obj.rollout !== undefined && obj.rollout !== null && obj.rollout !== 100
+      ? `\n${chalk.green("Rollout:")} ${obj.rollout.toLocaleString()}%`
+      : "";
 
   if (!packageObject || !packageObject.metrics) {
     return chalk.magenta("No installs recorded").toString() + (rolloutString || "");
@@ -1162,6 +1164,8 @@ function promote(command: cli.IPromoteCommand): Promise<void> {
     isDisabled: command.disabled,
     isMandatory: command.mandatory,
     rollout: command.rollout,
+    holdDurationMinutes: command.holdDurationMinutes,
+    rampDurationMinutes: command.rampDurationMinutes,
   };
 
   return sdk
@@ -1189,6 +1193,8 @@ function patch(command: cli.IPatchCommand): Promise<void> {
     isMandatory: command.mandatory,
     isDisabled: command.disabled,
     rollout: command.rollout,
+    holdDurationMinutes: command.holdDurationMinutes,
+    rampDurationMinutes: command.rampDurationMinutes,
   };
 
   for (const updateProperty in packageInfo) {
@@ -1239,6 +1245,8 @@ export const release = (command: cli.IReleaseCommand): Promise<void> => {
     isDisabled: command.disabled,
     isMandatory: command.mandatory,
     rollout: command.rollout,
+    holdDurationMinutes: command.holdDurationMinutes,
+    rampDurationMinutes: command.rampDurationMinutes,
   };
 
   return sdk

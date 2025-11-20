@@ -501,6 +501,18 @@ yargs
           "Percentage of users this release should be immediately available to. This attribute can only be increased from the current value.",
         type: "string",
       })
+      .option("holdDuration", {
+        default: null,
+        demand: false,
+        description: "Minutes to keep the rollout at 0% before automatically ramping up",
+        type: "number",
+      })
+      .option("rampDuration", {
+        default: null,
+        demand: false,
+        description: "Minutes to progress the rollout from its current percentage to 100%",
+        type: "number",
+      })
       .option("targetBinaryVersion", {
         alias: "t",
         default: null,
@@ -570,6 +582,18 @@ yargs
         demand: false,
         description: "Percentage of users this update should be immediately available to",
         type: "string",
+      })
+      .option("holdDuration", {
+        default: null,
+        demand: false,
+        description: "Minutes to keep the promoted release at 0% before ramping",
+        type: "number",
+      })
+      .option("rampDuration", {
+        default: null,
+        demand: false,
+        description: "Minutes to automatically ramp the rollout to 100%",
+        type: "number",
       })
       .option("targetBinaryVersion", {
         alias: "t",
@@ -653,6 +677,18 @@ yargs
         demand: false,
         description: "Percentage of users this release should be available to",
         type: "string",
+      })
+      .option("holdDuration", {
+        default: null,
+        demand: false,
+        description: "Minutes to hold the rollout at 0% before it begins ramping",
+        type: "number",
+      })
+      .option("rampDuration", {
+        default: null,
+        demand: false,
+        description: "Minutes to automatically ramp the rollout from its starting percentage to 100%",
+        type: "number",
       })
       .check((argv: any, aliases: { [aliases: string]: string }): any => {
         return checkValidReleaseOptions(argv);
@@ -758,6 +794,18 @@ yargs
         demand: false,
         description: "Percentage of users this release should be immediately available to",
         type: "string",
+      })
+      .option("holdDuration", {
+        default: null,
+        demand: false,
+        description: "Minutes to keep the rollout at 0% before it begins ramping",
+        type: "number",
+      })
+      .option("rampDuration", {
+        default: null,
+        demand: false,
+        description: "Minutes to automatically ramp the rollout to 100%",
+        type: "number",
       })
       .option("sourcemapOutput", {
         alias: "s",
@@ -1159,6 +1207,8 @@ export function createCommand(): cli.ICommand {
           patchCommand.mandatory = argv["mandatory"] as any;
           patchCommand.rollout = getRolloutValue(argv["rollout"] as any);
           patchCommand.appStoreVersion = argv["targetBinaryVersion"] as any;
+          patchCommand.holdDurationMinutes = getDurationMinutes(argv["holdDuration"], "hold-duration");
+          patchCommand.rampDurationMinutes = getDurationMinutes(argv["rampDuration"], "ramp-duration");
         }
         break;
 
@@ -1178,6 +1228,8 @@ export function createCommand(): cli.ICommand {
           deploymentPromoteCommand.noDuplicateReleaseError = argv["noDuplicateReleaseError"] as any;
           deploymentPromoteCommand.rollout = getRolloutValue(argv["rollout"] as any);
           deploymentPromoteCommand.appStoreVersion = argv["targetBinaryVersion"] as any;
+          deploymentPromoteCommand.holdDurationMinutes = getDurationMinutes(argv["holdDuration"], "hold-duration");
+          deploymentPromoteCommand.rampDurationMinutes = getDurationMinutes(argv["rampDuration"], "ramp-duration");
         }
         break;
 
@@ -1204,6 +1256,8 @@ export function createCommand(): cli.ICommand {
           releaseCommand.mandatory = argv["mandatory"] as any;
           releaseCommand.noDuplicateReleaseError = argv["noDuplicateReleaseError"] as any;
           releaseCommand.rollout = getRolloutValue(argv["rollout"] as any);
+          releaseCommand.holdDurationMinutes = getDurationMinutes(argv["holdDuration"], "hold-duration");
+          releaseCommand.rampDurationMinutes = getDurationMinutes(argv["rampDuration"], "ramp-duration");
         }
         break;
 
@@ -1238,6 +1292,8 @@ export function createCommand(): cli.ICommand {
           releaseReactCommand.xcodeProjectFile = argv["xcodeProjectFile"] as any;
           releaseReactCommand.xcodeTargetName = argv["xcodeTargetName"] as any;
           releaseReactCommand.buildConfigurationName = argv["buildConfigurationName"] as any;
+          releaseReactCommand.holdDurationMinutes = getDurationMinutes(argv["holdDuration"], "hold-duration");
+          releaseReactCommand.rampDurationMinutes = getDurationMinutes(argv["rampDuration"], "ramp-duration");
         }
         break;
 
@@ -1297,6 +1353,19 @@ function checkValidReleaseOptions(args: any): boolean {
 
 function getRolloutValue(input: string): number {
   return input ? parseInt(input.replace("%", "")) : null;
+}
+
+function getDurationMinutes(input: any, optionName: string): number {
+  if (input === undefined || input === null) {
+    return null;
+  }
+
+  const parsedValue: number = typeof input === "number" ? input : parseInt(input, 10);
+  if (isNaN(parsedValue) || parsedValue < 0) {
+    throw new Error(`The value for "--${optionName}" must be a non-negative integer.`);
+  }
+
+  return parsedValue;
 }
 
 function getServerUrl(url: string): string {

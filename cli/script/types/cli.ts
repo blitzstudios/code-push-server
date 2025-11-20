@@ -155,6 +155,8 @@ export interface IPackageInfo {
   disabled?: boolean;
   mandatory?: boolean;
   rollout?: number;
+  holdDurationMinutes?: number;
+  rampDurationMinutes?: number;
 }
 
 export interface IPatchCommand extends ICommand, IPackageInfo {

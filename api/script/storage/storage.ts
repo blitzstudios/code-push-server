@@ -100,6 +100,8 @@ export interface Package {
   releasedBy?: string;
   releaseMethod?: string; // "Upload", "Promote" or "Rollback". Unknown if unspecified
   rollout?: number;
+  holdDurationMinutes?: number;
+  rampDurationMinutes?: number;
   size: number;
   uploadTime: number;
 }

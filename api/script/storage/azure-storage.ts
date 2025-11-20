@@ -631,6 +631,8 @@ export class AzureStorage implements storage.Storage {
           packageHistory && packageHistory.length ? packageHistory[packageHistory.length - 1] : null;
         if (lastPackage) {
           lastPackage.rollout = null;
+          lastPackage.holdDurationMinutes = null;
+          lastPackage.rampDurationMinutes = null;
         }
 
         packageHistory.push(appPackage);

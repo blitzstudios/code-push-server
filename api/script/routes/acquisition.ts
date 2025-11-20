@@ -36,7 +36,18 @@ function getUrlKey(originalUrl: string): string {
   const obj: any = URL.parse(originalUrl, /*parseQueryString*/ true);
   delete obj.query.clientUniqueId;
   delete obj.query.client_unique_id;
+  delete obj.query.beta;
   return obj.pathname + "?" + queryString.stringify(obj.query);
+}
+
+function parseBooleanQueryParam(value: any): boolean {
+  if (value === undefined || value === null) {
+    return false;
+  }
+
+  const normalized = Array.isArray(value) ? value[value.length - 1] : value;
+  const stringValue = String(normalized).toLowerCase();
+  return stringValue === "true" || stringValue === "1";
 }
 
 function createResponseUsingStorage(
@@ -122,18 +133,34 @@ function createResponseUsingStorage(
 
 function buildUpdateCheckBody(
   response: redis.CacheableResponse,
-  clientUniqueId: string
+  clientUniqueId: string,
+  betaRequested: boolean
 ): { updateInfo: UpdateCheckResponse } {
   const cachedResponseObject = <UpdateCheckCacheResponse>response.body;
   let giveRolloutPackage: boolean = false;
-  if (cachedResponseObject.rolloutPackage && clientUniqueId) {
-    const releaseSpecificString: string =
-      cachedResponseObject.rolloutPackage.label || cachedResponseObject.rolloutPackage.packageHash;
-    giveRolloutPackage = rolloutSelector.isSelectedForRollout(
-      clientUniqueId,
-      cachedResponseObject.rollout,
-      releaseSpecificString
-    );
+  if (cachedResponseObject.rolloutPackage) {
+    if (betaRequested) {
+      giveRolloutPackage = true;
+    } else if (clientUniqueId) {
+      const releaseSpecificString: string =
+        cachedResponseObject.rolloutPackage.label || cachedResponseObject.rolloutPackage.packageHash;
+      const effectiveRollout = rolloutSelector.getEffectiveRollout({
+        rollout: cachedResponseObject.rollout,
+        holdDurationMinutes: cachedResponseObject.rolloutHoldDurationMinutes,
+        rampDurationMinutes: cachedResponseObject.rolloutRampDurationMinutes,
+        uploadTime: cachedResponseObject.rolloutUploadTime,
+      });
+
+      if (effectiveRollout >= 100) {
+        giveRolloutPackage = true;
+      } else if (effectiveRollout > 0) {
+        giveRolloutPackage = rolloutSelector.isSelectedForRollout(
+          clientUniqueId,
+          effectiveRollout,
+          releaseSpecificString
+        );
+      }
+    }
   }
 
   const updateCheckBody: { updateInfo: UpdateCheckResponse } = {
@@ -177,6 +204,7 @@ export function getAcquisitionRouter(config: AcquisitionConfig): express.Router 
       const deploymentKey: string = String(req.query.deploymentKey || req.query.deployment_key);
       const key: string = redis.Utilities.getDeploymentKeyHash(deploymentKey);
       const clientUniqueId: string = String(req.query.clientUniqueId || req.query.client_unique_id);
+      const betaRequested: boolean = parseBooleanQueryParam(req.query.beta);
       const url: string = getUrlKey(req.originalUrl);
       const memCacheKey: string = key + "|" + url;
       let fromCache: boolean = true;
@@ -184,7 +212,7 @@ export function getAcquisitionRouter(config: AcquisitionConfig): express.Router 
 
       const memValue = updateCheckMicrocache.get(memCacheKey);
       if (memValue) {
-        const updateCheckBody = buildUpdateCheckBody(memValue, clientUniqueId);
+        const updateCheckBody = buildUpdateCheckBody(memValue, clientUniqueId, betaRequested);
         res.locals.fromCache = true;
         res.status(memValue.statusCode).send(newApi ? utils.convertObjectToSnakeCase(updateCheckBody) : updateCheckBody);
         return;
@@ -206,7 +234,7 @@ export function getAcquisitionRouter(config: AcquisitionConfig): express.Router 
             return q<void>(null);
           }
 
-          const updateCheckBody = buildUpdateCheckBody(response, clientUniqueId);
+          const updateCheckBody = buildUpdateCheckBody(response, clientUniqueId, betaRequested);
 
           res.locals.fromCache = fromCache;
           res.status(response.statusCode).send(newApi ? utils.convertObjectToSnakeCase(updateCheckBody) : updateCheckBody);

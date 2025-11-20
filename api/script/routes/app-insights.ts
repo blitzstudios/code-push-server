@@ -215,7 +215,7 @@ export class AppInsights {
         } else if (resource === ServiceResource.Release || resource === ServiceResource.Promote) {
           if (req.body) {
             const info: restTypes.PackageInfo = tryJSON(req.body.packageInfo) || req.body.packageInfo;
-            if (info && info.rollout) {
+            if (info && info.rollout !== undefined && info.rollout !== null) {
               let value: string;
               switch (method) {
                 case "POST":

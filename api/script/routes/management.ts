@@ -57,6 +57,40 @@ export function getManagementRouter(config: ManagementConfig): Router {
   const router: Router = Router();
   const nameResolver: NameResolver = new NameResolver(config.storage);
 
+  function hasScheduleFields(info: restTypes.PackageInfo): boolean {
+    return validationUtils.isDefined(info.holdDurationMinutes) || validationUtils.isDefined(info.rampDurationMinutes);
+  }
+
+  function ensureRolloutConfiguredForSchedule(info: restTypes.PackageInfo, currentRollout?: number): void {
+    if (hasScheduleFields(info)) {
+      const rolloutToValidate = validationUtils.isDefined(info.rollout) ? info.rollout : currentRollout;
+      if (!validationUtils.isDefined(rolloutToValidate) || rolloutToValidate === 100) {
+        throw errorUtils.restError(
+          errorUtils.ErrorCode.MalformedRequest,
+          "Specifying hold/ramp durations requires setting a rollout value below 100."
+        );
+      }
+    }
+  }
+
+  function clearRolloutSchedule(pkg: storageTypes.Package): void {
+    if (!pkg) {
+      return;
+    }
+
+    pkg.holdDurationMinutes = null;
+    pkg.rampDurationMinutes = null;
+  }
+
+  function applyRolloutScheduleFields(target: storageTypes.Package, info: restTypes.PackageInfo): void {
+    if (!target || !info) {
+      return;
+    }
+
+    target.holdDurationMinutes = validationUtils.isDefined(info.holdDurationMinutes) ? info.holdDurationMinutes : null;
+    target.rampDurationMinutes = validationUtils.isDefined(info.rampDurationMinutes) ? info.rampDurationMinutes : null;
+  }
+
   router.get("/account", (req: Request, res: Response, next: (err?: any) => void): any => {
     const accountId: string = req.user.id;
     storage
@@ -720,6 +754,11 @@ export function getManagementRouter(config: ManagementConfig): Router {
         }
 
         const newRolloutValue: number = info.rollout;
+        const scheduleFieldsProvided: boolean = hasScheduleFields(info);
+        if (scheduleFieldsProvided) {
+          const rolloutForSchedule = validationUtils.isDefined(newRolloutValue) ? newRolloutValue : packageToUpdate.rollout;
+          ensureRolloutConfiguredForSchedule(info, rolloutForSchedule);
+        }
         if (validationUtils.isDefined(newRolloutValue)) {
           let errorMessage: string;
           if (!isUnfinishedRollout(packageToUpdate.rollout) && newRolloutValue !== 100) {
@@ -733,8 +772,30 @@ export function getManagementRouter(config: ManagementConfig): Router {
           }
 
           packageToUpdate.rollout = newRolloutValue === 100 ? null : newRolloutValue;
+          if (!isUnfinishedRollout(packageToUpdate.rollout)) {
+            clearRolloutSchedule(packageToUpdate);
+          }
           updateRelease = true;
         }
+
+        const rolloutWillBeActive: boolean = isUnfinishedRollout(packageToUpdate.rollout);
+        if (scheduleFieldsProvided && !rolloutWillBeActive) {
+          throw errorUtils.restError(
+            errorUtils.ErrorCode.Conflict,
+            "Cannot update rollout scheduling fields for a release without an active rollout."
+          );
+        }
+
+        if (validationUtils.isDefined(info.holdDurationMinutes) && packageToUpdate.holdDurationMinutes !== info.holdDurationMinutes) {
+          packageToUpdate.holdDurationMinutes = info.holdDurationMinutes;
+          updateRelease = true;
+        }
+
+        if (validationUtils.isDefined(info.rampDurationMinutes) && packageToUpdate.rampDurationMinutes !== info.rampDurationMinutes) {
+          packageToUpdate.rampDurationMinutes = info.rampDurationMinutes;
+          updateRelease = true;
+        }
+
 
         const newAppVersion: string = info.appVersion;
         if (newAppVersion && packageToUpdate.appVersion !== newAppVersion) {
@@ -790,6 +851,7 @@ export function getManagementRouter(config: ManagementConfig): Router {
       errorUtils.sendMalformedRequestError(res, JSON.stringify(validationErrors));
       return;
     }
+    ensureRolloutConfiguredForSchedule(restPackage);
 
     fs.stat(filePath, (err: NodeJS.ErrnoException, stats: fs.Stats): void => {
       if (err) {
@@ -874,6 +936,7 @@ export function getManagementRouter(config: ManagementConfig): Router {
         })
         .then((manifestBlobUrl?: string) => {
           storagePackage = converterUtils.toStoragePackage(restPackage);
+          applyRolloutScheduleFields(storagePackage, restPackage);
           if (manifestBlobUrl) {
             storagePackage.manifestBlobUrl = manifestBlobUrl;
           }
@@ -1005,6 +1068,7 @@ export function getManagementRouter(config: ManagementConfig): Router {
         errorUtils.sendMalformedRequestError(res, JSON.stringify(validationErrors));
         return;
       }
+      ensureRolloutConfiguredForSchedule(info);
 
       let appId: string;
       let destDeployment: storageTypes.Deployment;
@@ -1068,13 +1132,14 @@ export function getManagementRouter(config: ManagementConfig): Router {
             isMandatory: isMandatory,
             manifestBlobUrl: sourcePackage.manifestBlobUrl,
             packageHash: sourcePackage.packageHash,
-            rollout: info.rollout || null,
+            rollout: validationUtils.isDefined(info.rollout) ? (info.rollout === 100 ? null : info.rollout) : null,
             size: sourcePackage.size,
             uploadTime: new Date().getTime(),
             releaseMethod: storageTypes.ReleaseMethod.Promote,
             originalLabel: sourcePackage.label,
             originalDeployment: sourceDeploymentName,
           };
+          applyRolloutScheduleFields(newPackage, info);
 
           return storage
             .commitPackage(accountId, appId, destDeployment.id, newPackage)
