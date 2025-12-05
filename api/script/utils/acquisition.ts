@@ -1,12 +1,14 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
-
+import * as q from "q";
 import * as semver from "semver";
-import { UpdateCheckCacheResponse, UpdateCheckRequest, UpdateCheckResponse } from "../types/rest-definitions";
-import { Package } from "../storage/storage";
-import { isUnfinishedRollout } from "./rollout-selector";
+import { CachedRelease, UpdateCheckCacheResponse, UpdateCheckRequest, UpdateCheckResponse } from "../types/rest-definitions";
+import { Package, PackageHashToBlobInfoMap } from "../storage/storage";
 import * as env from "../environment";
 import * as URL from "url";
+import * as rolloutSelector from "./rollout-selector";
+import { CacheableResponse } from "../redis-manager";
+import { normalizeAppVersion } from "./update-check-request";
 
 function proxyBlobUrl(azureUrl: string): string {
   try {
@@ -27,142 +29,234 @@ function proxyBlobUrl(azureUrl: string): string {
   }
 }
 
-interface UpdatePackage {
-  response: UpdateCheckResponse;
-  rollout?: number;
-  holdDurationMinutes?: number;
-  rampDurationMinutes?: number;
-  uploadTime?: number;
-}
-
 export function getUpdatePackageInfo(packageHistory: Package[], request: UpdateCheckRequest): UpdateCheckCacheResponse {
-  const updatePackage: UpdatePackage = getUpdatePackage(packageHistory, request, /*ignoreRolloutPackages*/ false);
-  let cacheResponse: UpdateCheckCacheResponse;
+  const releases: CachedRelease[] = [];
 
-  if (isUnfinishedRollout(updatePackage.rollout)) {
-    const origUpdatePackage: UpdatePackage = getUpdatePackage(packageHistory, request, /*ignoreRolloutPackages*/ true);
-    cacheResponse = <UpdateCheckCacheResponse>{
-      originalPackage: origUpdatePackage.response,
-      rolloutPackage: updatePackage.response,
-      rollout: updatePackage.rollout,
-      rolloutHoldDurationMinutes: updatePackage.holdDurationMinutes,
-      rolloutRampDurationMinutes: updatePackage.rampDurationMinutes,
-      rolloutUploadTime: updatePackage.uploadTime,
-    };
-  } else {
-    cacheResponse = { originalPackage: updatePackage.response };
+  if (packageHistory && packageHistory.length) {
+    const normalizedVersion = normalizeAppVersion(request.appVersion);
+
+    for (let i = packageHistory.length - 1; i >= 0; i--) {
+      const pkg = packageHistory[i];
+      if (request.isCompanion || semver.satisfies(normalizedVersion, pkg.appVersion)) {
+        releases.push(convertToCachedRelease(pkg));
+      }
+    }
   }
 
-  return cacheResponse;
+  return {
+    releases,
+  };
 }
 
-function getUpdatePackage(packageHistory: Package[], request: UpdateCheckRequest, ignoreRolloutPackages?: boolean): UpdatePackage {
-  const updateDetails: UpdateCheckResponse = {
-    downloadURL: "",
-    description: "",
-    isAvailable: false,
-    isMandatory: false,
-    appVersion: "",
-    packageHash: "",
-    label: "",
-    packageSize: 0,
+function convertToCachedRelease(pkg: Package): CachedRelease {
+  return {
+    appVersion: pkg.appVersion,
+    blobUrl: pkg.blobUrl,
+    description: pkg.description,
+    isDisabled: pkg.isDisabled,
+    isMandatory: pkg.isMandatory,
+    label: pkg.label,
+    packageHash: pkg.packageHash,
+    size: pkg.size,
+    rollout: pkg.rollout,
+    rolloutHoldDurationMinutes: pkg.holdDurationMinutes,
+    rolloutRampDurationMinutes: pkg.rampDurationMinutes,
+    rolloutUploadTime: pkg.uploadTime,
+  };
+}
+
+export function createUpdateInfoFromRelease(release: CachedRelease): UpdateCheckResponse {
+  const response: UpdateCheckResponse = {
+    downloadURL: proxyBlobUrl(release.blobUrl),
+    description: release.description,
+    isAvailable: !release.isDisabled,
+    isMandatory: !!release.isMandatory,
+    appVersion: release.appVersion,
+    packageHash: release.packageHash,
+    label: release.label,
+    packageSize: release.size,
     updateAppVersion: false,
   };
 
-  if (!packageHistory || packageHistory.length === 0) {
-    updateDetails.shouldRunBinaryVersion = true;
-    return { response: updateDetails };
+  response.target_binary_range = release.appVersion;
+  return response;
+}
+
+export function applyDiffPayload(
+  updateInfo: UpdateCheckResponse,
+  diffMap: PackageHashToBlobInfoMap | undefined,
+  requestPackageHash: string
+): void {
+  if (!requestPackageHash || !diffMap) {
+    return;
   }
 
-  let foundRequestPackageInHistory: boolean = false;
-  let latestSatisfyingEnabledPackage: Package;
-  let latestEnabledPackage: Package;
-  let rollout: number = null;
-  let shouldMakeUpdateMandatory: boolean = false;
+  const diff = diffMap[requestPackageHash];
+  if (diff) {
+    updateInfo.downloadURL = proxyBlobUrl(diff.url);
+    updateInfo.packageSize = diff.size;
+  }
+}
 
-  for (let i = packageHistory.length - 1; i >= 0; i--) {
-    const packageEntry: Package = packageHistory[i];
-    // Check if this packageEntry is the same as the one that the client is running.
-    // Note that older client plugin versions do not send the release label. If the
-    // label is supplied, we use label comparison, since developers can release the
-    // same update twice. Otherwise, we fall back to hash comparison.
-    // If request is missing both label and hash we take the latest package
-    // as we cannot determine which one the client is running
-    foundRequestPackageInHistory =
-      foundRequestPackageInHistory ||
-      (!request.label && !request.packageHash) ||
-      (request.label && packageEntry.label === request.label) ||
-      (!request.label && packageEntry.packageHash === request.packageHash);
-    if (packageEntry.isDisabled || (ignoreRolloutPackages && isUnfinishedRollout(packageEntry.rollout))) {
-      continue;
-    }
-
-    latestEnabledPackage = latestEnabledPackage || packageEntry;
-    if (!request.isCompanion && !semver.satisfies(request.appVersion, packageEntry.appVersion)) {
-      continue;
-    }
-
-    latestSatisfyingEnabledPackage = latestSatisfyingEnabledPackage || packageEntry;
-    if (foundRequestPackageInHistory) {
-      // All the releases further down the history are older than the one the
-      // client is running, so we can stop the scan.
-      break;
-    } else if (packageEntry.isMandatory) {
-      // If this release is mandatory, newer than the one the client is running,
-      // and satifies the client's binary version, we should also make the
-      // latest update mandatory. We got all the information we need from the
-      // history, so stop the scan.
-      shouldMakeUpdateMandatory = true;
-      break;
-    }
+export function isClientPackage(release: CachedRelease, requestLabel: string, requestPackageHash: string): boolean {
+  if (requestLabel) {
+    return release.label === requestLabel;
   }
 
-  // If none of the enabled releases have a range that satisfies the client's binary
-  // version, tell the client to run the version bundled in the binary.
-  updateDetails.shouldRunBinaryVersion = !latestSatisfyingEnabledPackage;
-  if (!latestEnabledPackage) {
-    // None of the releases in this deployment are enabled, so return no update.
-    return { response: updateDetails };
-  } else if (updateDetails.shouldRunBinaryVersion || latestSatisfyingEnabledPackage.packageHash === request.packageHash) {
-    // Either none of the releases in this deployment satisfy the client's binary
-    // version, or the client already has the latest relevant update, so return no
-    // update, but also tell the client what appVersion the latest release is on and
-    // whether they should trigger a store update.
-    if (semver.gtr(request.appVersion, latestEnabledPackage.appVersion)) {
-      updateDetails.appVersion = latestEnabledPackage.appVersion;
-    } else if (!semver.satisfies(request.appVersion, latestEnabledPackage.appVersion)) {
-      updateDetails.updateAppVersion = true;
-      updateDetails.appVersion = latestEnabledPackage.appVersion;
-    }
+  return !!requestPackageHash && release.packageHash === requestPackageHash;
+}
 
-    return { response: updateDetails };
-  } else if (
-    request.packageHash &&
-    latestSatisfyingEnabledPackage.diffPackageMap &&
-    latestSatisfyingEnabledPackage.diffPackageMap[request.packageHash]
-  ) {
-    updateDetails.downloadURL = proxyBlobUrl(latestSatisfyingEnabledPackage.diffPackageMap[request.packageHash].url);
-    updateDetails.packageSize = latestSatisfyingEnabledPackage.diffPackageMap[request.packageHash].size;
-  } else {
-    updateDetails.downloadURL = proxyBlobUrl(latestSatisfyingEnabledPackage.blobUrl);
-    updateDetails.packageSize = latestSatisfyingEnabledPackage.size;
+export function isClientSelectedForRollout(release: CachedRelease, clientUniqueId: string, releaseKey: string): boolean {
+  if (!clientUniqueId || release.rollout === undefined || release.rollout === null) {
+    return false;
   }
 
-  updateDetails.description = latestSatisfyingEnabledPackage.description;
-  updateDetails.isMandatory = shouldMakeUpdateMandatory || latestSatisfyingEnabledPackage.isMandatory;
-  updateDetails.isAvailable = true;
-  updateDetails.label = latestSatisfyingEnabledPackage.label;
-  updateDetails.packageHash = latestSatisfyingEnabledPackage.packageHash;
-  rollout = latestSatisfyingEnabledPackage.rollout;
+  const effectiveRollout = rolloutSelector.getEffectiveRollout({
+    rollout: release.rollout,
+    holdDurationMinutes: release.rolloutHoldDurationMinutes,
+    rampDurationMinutes: release.rolloutRampDurationMinutes,
+    uploadTime: release.rolloutUploadTime,
+  });
 
-  // Old plugins will only work with updates with app versions that are valid semver
-  // (i.e. not a range), so we return the same version string as the requested one
-  updateDetails.appVersion = request.appVersion;
+  return rolloutSelector.isSelectedForRollout(clientUniqueId, effectiveRollout, releaseKey);
+}
+
+export function buildNoUpdateResponse(rawAppVersion: string, normalizedAppVersion: string): UpdateCheckResponse {
   return {
-    response: updateDetails,
-    rollout: rollout,
-    holdDurationMinutes: latestSatisfyingEnabledPackage.holdDurationMinutes,
-    rampDurationMinutes: latestSatisfyingEnabledPackage.rampDurationMinutes,
-    uploadTime: latestSatisfyingEnabledPackage.uploadTime,
+    isAvailable: false,
+    appVersion: rawAppVersion || normalizedAppVersion,
+    updateAppVersion: false,
   };
 }
+
+export type DiffMapFetcher = (packageHash: string) => q.Promise<PackageHashToBlobInfoMap>;
+
+export async function buildUpdateCheckBody(
+  response: CacheableResponse,
+  clientUniqueId: string,
+  betaRequested: boolean,
+  requestLabel: string,
+  requestPackageHash: string,
+  rawAppVersion: string,
+  normalizedAppVersion: string,
+  requestIsCompanion: boolean,
+  diffMapFetcher: DiffMapFetcher
+): Promise<{ updateInfo: UpdateCheckResponse }> {
+  const cachedResponseObject = <UpdateCheckCacheResponse>response.body;
+  const releases = cachedResponseObject.releases || [];
+
+  let selectedUpdate: UpdateCheckResponse = null;
+  let selectedRelease: CachedRelease = null;
+  let forceMandatory: boolean = false;
+  let pendingMandatory: boolean = false;
+
+  for (const release of releases) {
+    if (!release) {
+      continue;
+    }
+
+    const isCurrentRelease = isClientPackage(release, requestLabel, requestPackageHash);
+
+      if (isCurrentRelease && release.isDisabled) {
+      continue;
+    }
+
+    if (isCurrentRelease) {
+      if (selectedUpdate && selectedRelease) {
+        await hydrateDiffPayloadForRelease(selectedUpdate, selectedRelease, requestPackageHash, diffMapFetcher);
+        return finalizeUpdateCheckResponse(selectedUpdate, selectedRelease, forceMandatory, rawAppVersion, normalizedAppVersion);
+      }
+
+      const noUpdate = buildNoUpdateResponse(rawAppVersion, normalizedAppVersion);
+      noUpdate.target_binary_range = noUpdate.appVersion;
+      return { updateInfo: noUpdate };
+    }
+
+    if (release.isDisabled) {
+      continue;
+    }
+
+    const releaseApplies =
+      requestIsCompanion ||
+      (!!normalizedAppVersion && normalizedAppVersion.length > 0 && semver.satisfies(normalizedAppVersion, release.appVersion));
+    if (!releaseApplies) {
+      continue;
+    }
+
+    if (selectedUpdate) {
+      if (release.isMandatory) {
+        forceMandatory = true;
+      }
+
+      continue;
+    }
+
+    const isRollout = rolloutSelector.isUnfinishedRollout(release.rollout);
+    let updateInfo: UpdateCheckResponse = null;
+
+    if (!isRollout) {
+      updateInfo = createUpdateInfoFromRelease(release);
+    } else if (betaRequested || isClientSelectedForRollout(release, clientUniqueId, release.label || release.packageHash)) {
+      updateInfo = createUpdateInfoFromRelease(release);
+    }
+
+    if (updateInfo) {
+      selectedUpdate = updateInfo;
+      selectedRelease = release;
+      forceMandatory = pendingMandatory || !!release.isMandatory;
+      continue;
+    }
+
+    if (release.isMandatory) {
+      pendingMandatory = true;
+    }
+  }
+
+  if (selectedUpdate && selectedRelease) {
+    await hydrateDiffPayloadForRelease(selectedUpdate, selectedRelease, requestPackageHash, diffMapFetcher);
+    return finalizeUpdateCheckResponse(selectedUpdate, selectedRelease, forceMandatory, rawAppVersion, normalizedAppVersion);
+  }
+
+  const fallback = buildNoUpdateResponse(rawAppVersion, normalizedAppVersion);
+  fallback.target_binary_range = fallback.appVersion;
+  return { updateInfo: fallback };
+}
+
+async function hydrateDiffPayloadForRelease(
+  updateInfo: UpdateCheckResponse,
+  release: CachedRelease,
+  requestPackageHash: string,
+  diffMapFetcher: DiffMapFetcher
+): Promise<void> {
+  if (!requestPackageHash || !release) {
+    return;
+  }
+
+  try {
+    const diffMap = await diffMapFetcher(release.packageHash);
+    if (diffMap) {
+      applyDiffPayload(updateInfo, diffMap, requestPackageHash);
+    }
+  } catch (error) {
+    console.warn("Failed to hydrate diff package map for updateCheck", error);
+  }
+}
+
+function finalizeUpdateCheckResponse(
+  updateInfo: UpdateCheckResponse,
+  release: CachedRelease,
+  forceMandatory: boolean,
+  rawAppVersion: string,
+  normalizedAppVersion: string
+): { updateInfo: UpdateCheckResponse } {
+  if (forceMandatory) {
+    updateInfo.isMandatory = true;
+  }
+
+  const clientVersion = rawAppVersion || normalizedAppVersion;
+  updateInfo.target_binary_range = clientVersion;
+  updateInfo.appVersion = clientVersion;
+
+  return { updateInfo };
+}
+

@@ -626,15 +626,6 @@ export class AzureStorage implements storage.Storage {
       .then((account: storage.Account) => {
         appPackage.releasedBy = account.email;
 
-        // Remove the rollout value for the last package.
-        const lastPackage: storage.Package =
-          packageHistory && packageHistory.length ? packageHistory[packageHistory.length - 1] : null;
-        if (lastPackage) {
-          lastPackage.rollout = null;
-          lastPackage.holdDurationMinutes = null;
-          lastPackage.rampDurationMinutes = null;
-        }
-
         packageHistory.push(appPackage);
 
         if (packageHistory.length > AzureStorage.MAX_PACKAGE_HISTORY_LENGTH) {
