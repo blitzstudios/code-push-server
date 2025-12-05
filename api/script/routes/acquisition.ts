@@ -9,16 +9,21 @@ import * as acquisitionUtils from "../utils/acquisition";
 import * as errorUtils from "../utils/rest-error-handling";
 import * as redis from "../redis-manager";
 import * as restHeaders from "../utils/rest-headers";
-import * as rolloutSelector from "../utils/rollout-selector";
 import * as storageTypes from "../storage/storage";
-import { UpdateCheckCacheResponse, UpdateCheckRequest, UpdateCheckResponse } from "../types/rest-definitions";
+import { UpdateCheckCacheResponse, UpdateCheckRequest } from "../types/rest-definitions";
 import * as validationUtils from "../utils/validation";
 
 import * as q from "q";
-import * as queryString from "querystring";
-import * as URL from "url";
 import Promise = q.Promise;
 import { Microcache } from "../utils/microcache";
+import {
+  ParsedUpdateCheckRequest,
+  buildUpdateCheckCacheKey,
+  normalizeAppVersion,
+  parseUpdateCheckRequest,
+} from "../utils/update-check-request";
+import { createDiffMapFetcher, primeDiffCacheForReleases } from "../utils/diff-cache";
+import { SendUpdateCheckOptions, sendUpdateCheckResponse } from "../utils/update-check-response";
 
 const METRICS_BREAKING_VERSION = "1.5.2-beta";
 
@@ -26,24 +31,18 @@ const METRICS_BREAKING_VERSION = "1.5.2-beta";
 // Holds the fully cacheable response object for a short time window.
 const UPDATECHECK_MEM_TTL_MS: number = Number(process.env.UPDATECHECK_MEM_TTL_MS) || 30000;
 const updateCheckMicrocache = new Microcache<redis.CacheableResponse>(UPDATECHECK_MEM_TTL_MS);
+const UPDATECHECK_CACHE_SCHEMA_VERSION = "v2";
 
 export interface AcquisitionConfig {
   storage: storageTypes.Storage;
   redisManager: redis.RedisManager;
 }
 
-function getUrlKey(originalUrl: string): string {
-  const obj: any = URL.parse(originalUrl, /*parseQueryString*/ true);
-  delete obj.query.clientUniqueId;
-  delete obj.query.client_unique_id;
-  delete obj.query.beta;
-  return obj.pathname + "?" + queryString.stringify(obj.query);
-}
-
 function createResponseUsingStorage(
   req: express.Request,
   res: express.Response,
-  storage: storageTypes.Storage
+  storage: storageTypes.Storage,
+  redisManager: redis.RedisManager
 ): Promise<redis.CacheableResponse> {
   const deploymentKey: string = String(req.query.deploymentKey || req.query.deployment_key);
   const appVersion: string = String(req.query.appVersion || req.query.app_version);
@@ -58,36 +57,21 @@ function createResponseUsingStorage(
     label: String(req.query.label),
   };
 
-  let originalAppVersion: string;
-
-  // Make an exception to allow plain integer numbers e.g. "1", "2" etc.
-  const isPlainIntegerNumber: boolean = /^\d+$/.test(updateRequest.appVersion);
-  if (isPlainIntegerNumber) {
+  let originalAppVersion: string | undefined;
+  const normalizedAppVersion = normalizeAppVersion(updateRequest.appVersion);
+  if (normalizedAppVersion !== updateRequest.appVersion) {
     originalAppVersion = updateRequest.appVersion;
-    updateRequest.appVersion = originalAppVersion + ".0.0";
-  }
-
-  // Make an exception to allow missing patch versions e.g. "2.0" or "2.0-prerelease"
-  const isMissingPatchVersion: boolean = /^\d+\.\d+([\+\-].*)?$/.test(updateRequest.appVersion);
-  if (isMissingPatchVersion) {
-    originalAppVersion = updateRequest.appVersion;
-    const semverTagIndex = originalAppVersion.search(/[\+\-]/);
-    if (semverTagIndex === -1) {
-      updateRequest.appVersion += ".0";
-    } else {
-      updateRequest.appVersion = originalAppVersion.slice(0, semverTagIndex) + ".0" + originalAppVersion.slice(semverTagIndex);
-    }
+    updateRequest.appVersion = normalizedAppVersion;
   }
 
   if (validationUtils.isValidUpdateCheckRequest(updateRequest)) {
     return storage.getPackageHistoryFromDeploymentKey(updateRequest.deploymentKey).then((packageHistory: storageTypes.Package[]) => {
       const updateObject: UpdateCheckCacheResponse = acquisitionUtils.getUpdatePackageInfo(packageHistory, updateRequest);
-      if (isMissingPatchVersion || isPlainIntegerNumber) {
-        if (updateObject.originalPackage) {
-          updateObject.originalPackage.appVersion = originalAppVersion;
-        }
-        if (updateObject.rolloutPackage) {
-          updateObject.rolloutPackage.appVersion = originalAppVersion;
+
+      const packageLookup = new Map<string, storageTypes.Package>();
+      for (const pkg of packageHistory || []) {
+        if (pkg && pkg.packageHash) {
+          packageLookup.set(pkg.packageHash, pkg);
         }
       }
 
@@ -96,7 +80,7 @@ function createResponseUsingStorage(
         body: updateObject,
       };
 
-      return q(cacheableResponse);
+      return primeDiffCacheForReleases(deploymentKey, updateObject.releases, packageLookup, redisManager).then(() => cacheableResponse);
     });
   } else {
     if (!validationUtils.isValidKeyField(updateRequest.deploymentKey)) {
@@ -120,45 +104,6 @@ function createResponseUsingStorage(
 
     return q<redis.CacheableResponse>(null);
   }
-}
-
-function buildUpdateCheckBody(
-  response: redis.CacheableResponse,
-  clientUniqueId: string,
-  betaRequested: boolean
-): { updateInfo: UpdateCheckResponse } {
-  const cachedResponseObject = <UpdateCheckCacheResponse>response.body;
-  let giveRolloutPackage: boolean = false;
-  if (cachedResponseObject.rolloutPackage) {
-    if (betaRequested) {
-      giveRolloutPackage = true;
-    } else if (clientUniqueId) {
-      const releaseSpecificString: string =
-        cachedResponseObject.rolloutPackage.label || cachedResponseObject.rolloutPackage.packageHash;
-        
-      const effectiveRollout = rolloutSelector.getEffectiveRollout({
-        rollout: cachedResponseObject.rollout,
-        holdDurationMinutes: cachedResponseObject.rolloutHoldDurationMinutes,
-        rampDurationMinutes: cachedResponseObject.rolloutRampDurationMinutes,
-        uploadTime: cachedResponseObject.rolloutUploadTime,
-      });
-
-      giveRolloutPackage = rolloutSelector.isSelectedForRollout(
-        clientUniqueId,
-        effectiveRollout,
-        releaseSpecificString
-      );
-    }
-  }
-
-  const updateCheckBody: { updateInfo: UpdateCheckResponse } = {
-    updateInfo: giveRolloutPackage ? cachedResponseObject.rolloutPackage : cachedResponseObject.originalPackage,
-  };
-
-  // Change in new API
-  updateCheckBody.updateInfo.target_binary_range = updateCheckBody.updateInfo.appVersion;
-
-  return updateCheckBody;
 }
 
 export function getHealthRouter(config: AcquisitionConfig): express.Router {
@@ -189,20 +134,32 @@ export function getAcquisitionRouter(config: AcquisitionConfig): express.Router 
 
   const updateCheck = function (newApi: boolean) {
     return function (req: express.Request, res: express.Response, next: (err?: any) => void) {
-      const deploymentKey: string = String(req.query.deploymentKey || req.query.deployment_key);
+      const parsedRequest: ParsedUpdateCheckRequest = parseUpdateCheckRequest(req);
+      const deploymentKey: string = parsedRequest.deploymentKey;
       const key: string = redis.Utilities.getDeploymentKeyHash(deploymentKey);
-      const clientUniqueId: string = String(req.query.clientUniqueId || req.query.client_unique_id);
-      const betaRequested: boolean = String(req.query.beta).toLowerCase() === "true";
-      const url: string = getUrlKey(req.originalUrl);
+      const url: string = buildUpdateCheckCacheKey(req.originalUrl, UPDATECHECK_CACHE_SCHEMA_VERSION);
       const memCacheKey: string = key + "|" + url;
       let fromCache: boolean = true;
       let redisError: Error;
+      const diffMapFetcher = createDiffMapFetcher(deploymentKey, redisManager);
+
+      const responseOptionsBase: Omit<SendUpdateCheckOptions, "fromCache"> = {
+        res,
+        newApi,
+        clientUniqueId: parsedRequest.clientUniqueId,
+        betaRequested: parsedRequest.betaRequested,
+        requestLabel: parsedRequest.requestLabel,
+        requestPackageHash: parsedRequest.requestPackageHash,
+        rawAppVersion: parsedRequest.rawAppVersion,
+        normalizedAppVersion: parsedRequest.normalizedAppVersion,
+        isCompanion: parsedRequest.isCompanion,
+        diffMapFetcher,
+      };
 
       const memValue = updateCheckMicrocache.get(memCacheKey);
       if (memValue) {
-        const updateCheckBody = buildUpdateCheckBody(memValue, clientUniqueId, betaRequested);
-        res.locals.fromCache = true;
-        res.status(memValue.statusCode).send(newApi ? utils.convertObjectToSnakeCase(updateCheckBody) : updateCheckBody);
+        sendUpdateCheckResponse(memValue, { ...responseOptionsBase, fromCache: true })
+          .catch((error: any) => next(error));
         return;
       }
 
@@ -215,24 +172,22 @@ export function getAcquisitionRouter(config: AcquisitionConfig): express.Router 
         })
         .then((cachedResponse: redis.CacheableResponse) => {
           fromCache = !!cachedResponse;
-          return cachedResponse || createResponseUsingStorage(req, res, storage);
+          return cachedResponse || createResponseUsingStorage(req, res, storage, redisManager);
         })
         .then((response: redis.CacheableResponse) => {
           if (!response) {
             return q<void>(null);
           }
 
-          const updateCheckBody = buildUpdateCheckBody(response, clientUniqueId, betaRequested);
-
-          res.locals.fromCache = fromCache;
-          res.status(response.statusCode).send(newApi ? utils.convertObjectToSnakeCase(updateCheckBody) : updateCheckBody);
-
-          updateCheckMicrocache.set(memCacheKey, response);
-          if (!fromCache) {
-            return redisManager.setCachedResponse(key, url, response).catch((error: any) => {
-              console.warn("Failed to set updateCheck cache", error);
+          return sendUpdateCheckResponse(response, { ...responseOptionsBase, fromCache })
+            .then(() => {
+              updateCheckMicrocache.set(memCacheKey, response);
+              if (!fromCache) {
+                return redisManager.setCachedResponse(key, url, response).catch((error: any) => {
+                  console.warn("Failed to set updateCheck cache", error);
+                });
+              }
             });
-          }
         })
         .then(() => {
           if (redisError) {

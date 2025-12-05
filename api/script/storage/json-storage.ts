@@ -476,14 +476,6 @@ export class JsonStorage implements storage.Storage {
     deployment.package = appPackage;
     const history: storage.Package[] = deployment.packageHistory;
 
-    // Unset rollout value for last package for rollback.
-    const lastPackage: storage.Package = history.length ? history[history.length - 1] : null;
-    if (lastPackage) {
-      lastPackage.rollout = null;
-      lastPackage.holdDurationMinutes = null;
-      lastPackage.rampDurationMinutes = null;
-    }
-
     deployment.packageHistory.push(appPackage);
     appPackage.label = "v" + deployment.packageHistory.length;
 

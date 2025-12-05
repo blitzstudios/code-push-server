@@ -2,9 +2,9 @@
 // Licensed under the MIT License.
 
 import * as assert from "assert";
-import * as express from "express";
 import * as q from "q";
 import * as redis from "redis";
+import { PackageHashToBlobInfoMap } from "./storage/storage";
 
 import Promise = q.Promise;
 
@@ -54,6 +54,10 @@ export module Utilities {
   export function getDeploymentKeyClientsHash(deploymentKey: string): string {
     return "deploymentKeyClients:" + deploymentKey;
   }
+
+  export function getDeploymentKeyDiffsHash(deploymentKey: string): string {
+    return "deploymentKeyDiffs:" + deploymentKey;
+  }
 }
 
 class PromisifiedRedisClient {
@@ -96,6 +100,7 @@ export class RedisManager {
   private _metricsClient: redis.RedisClient;
   private _promisifiedMetricsClient: PromisifiedRedisClient;
   private _setupMetricsClientPromise: Promise<void>;
+  private _diffMapFallback: Map<string, PackageHashToBlobInfoMap>;
 
   constructor() {
     if (process.env.REDIS_HOST && process.env.REDIS_PORT) {
@@ -126,6 +131,8 @@ export class RedisManager {
     } else {
       console.warn("No REDIS_HOST or REDIS_PORT environment variable configured.");
     }
+
+    this._diffMapFallback = new Map<string, PackageHashToBlobInfoMap>();
   }
 
   public get isEnabled(): boolean {
@@ -187,6 +194,59 @@ export class RedisManager {
         }
       })
       .then(() => {});
+  }
+
+  public setPackageDiffMap(deploymentKey: string, packageHash: string, diffMap: PackageHashToBlobInfoMap): Promise<void> {
+    if (!diffMap || !packageHash || !deploymentKey) {
+      return q<void>(null);
+    }
+
+    if (!this.isEnabled) {
+      this._diffMapFallback.set(this._getDiffFallbackKey(deploymentKey, packageHash), this._cloneDiffMap(diffMap));
+      return q<void>(null);
+    }
+
+    const serialized = JSON.stringify(diffMap);
+    const hash = Utilities.getDeploymentKeyDiffsHash(deploymentKey);
+    return this._promisifiedOpsClient.hset(hash, packageHash, serialized).then(() => {});
+  }
+
+  public getPackageDiffMap(deploymentKey: string, packageHash: string): Promise<PackageHashToBlobInfoMap> {
+    if (!packageHash || !deploymentKey) {
+      return q<PackageHashToBlobInfoMap>(null);
+    }
+
+    if (!this.isEnabled) {
+      const fallback = this._diffMapFallback.get(this._getDiffFallbackKey(deploymentKey, packageHash));
+      return q<PackageHashToBlobInfoMap>(fallback ? this._cloneDiffMap(fallback) : null);
+    }
+
+    const hash = Utilities.getDeploymentKeyDiffsHash(deploymentKey);
+    return this._promisifiedOpsClient.hget(hash, packageHash).then((serialized: string): Promise<PackageHashToBlobInfoMap> => {
+      if (!serialized) {
+        return q<PackageHashToBlobInfoMap>(null);
+      }
+
+      return q<PackageHashToBlobInfoMap>(JSON.parse(serialized));
+    });
+  }
+
+  public clearPackageDiffMaps(deploymentKey: string): Promise<void> {
+    if (!deploymentKey) {
+      return q<void>(null);
+    }
+
+    if (!this.isEnabled) {
+      const prefix = `${deploymentKey}:`;
+      Array.from(this._diffMapFallback.keys()).forEach((key) => {
+        if (key.startsWith(prefix)) {
+          this._diffMapFallback.delete(key);
+        }
+      });
+      return q<void>(null);
+    }
+
+    return this._promisifiedOpsClient.del(Utilities.getDeploymentKeyDiffsHash(deploymentKey)).then(() => {});
   }
 
   // Atomically increments the status field for the deployment by 1,
@@ -329,5 +389,17 @@ export class RedisManager {
         return this._promisifiedMetricsClient.execBatch(batchClient);
       })
       .then(() => {});
+  }
+
+  private _getDiffFallbackKey(deploymentKey: string, packageHash: string): string {
+    return `${deploymentKey}:${packageHash}`;
+  }
+
+  private _cloneDiffMap(diffMap: PackageHashToBlobInfoMap): PackageHashToBlobInfoMap {
+    if (!diffMap) {
+      return null;
+    }
+
+    return JSON.parse(JSON.stringify(diffMap));
   }
 }

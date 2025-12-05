@@ -875,14 +875,6 @@ export function getManagementRouter(config: ManagementConfig): Router {
         })
         .then((deployment: storageTypes.Deployment) => {
           deploymentToReleaseTo = deployment;
-          const existingPackage: storageTypes.Package = deployment.package;
-          if (existingPackage && isUnfinishedRollout(existingPackage.rollout) && !existingPackage.isDisabled) {
-            throw errorUtils.restError(
-              errorUtils.ErrorCode.Conflict,
-              "Please update the previous release to 100% rollout before releasing a new package."
-            );
-          }
-
           return storage.getPackageHistory(accountId, appId, deploymentToReleaseTo.id);
         })
         .then((history: storageTypes.Package[]) => {
@@ -1106,13 +1098,7 @@ export function getManagementRouter(config: ManagementConfig): Router {
               errorUtils.ErrorCode.MalformedRequest,
               "Rollout value must be an integer between 1 and 100, inclusive."
             );
-          } else if (destPackage && isUnfinishedRollout(destPackage.rollout) && !destPackage.isDisabled) {
-            throw errorUtils.restError(
-              errorUtils.ErrorCode.Conflict,
-              "Cannot promote to an unfinished rollout release unless it is already disabled."
-            );
           }
-
           return storage.getPackageHistory(accountId, appId, destDeployment.id);
         })
         .then((destHistory: storageTypes.Package[]) => {
@@ -1253,8 +1239,13 @@ export function getManagementRouter(config: ManagementConfig): Router {
     }
   );
 
-  function invalidateCachedPackage(deploymentKey: string): Q.Promise<void> {
-    return redisManager.invalidateCache(redis.Utilities.getDeploymentKeyHash(deploymentKey));
+  function invalidateCachedPackage(deploymentKey: string): Promise<void> {
+    return q
+      .all([
+        redisManager.invalidateCache(redis.Utilities.getDeploymentKeyHash(deploymentKey)),
+        redisManager.clearPackageDiffMaps(deploymentKey),
+      ])
+      .then(() => {});
   }
 
   function throwIfInvalidPermissions(app: storageTypes.App, requiredPermission: string): boolean {

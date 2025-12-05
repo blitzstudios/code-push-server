@@ -1,6 +1,16 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+import {
+  CachedRelease,
+  PackageInfo,
+  UpdateCheckCacheResponse,
+  UpdateCheckRequest,
+  UpdateCheckResponse,
+} from "../../../shared/types/update-check";
+
+export { PackageInfo, UpdateCheckResponse, CachedRelease, UpdateCheckCacheResponse, UpdateCheckRequest };
+
 interface AccessKeyBase {
   createdBy?: string;
   /*legacy*/ description?: string;
@@ -41,50 +51,6 @@ export interface DownloadReport {
   clientUniqueId: string;
   deploymentKey: string;
   label: string;
-}
-
-/*inout*/
-export interface PackageInfo {
-  appVersion?: string;
-  description?: string;
-  isDisabled?: boolean;
-  isMandatory?: boolean;
-  /*generated*/ label?: string;
-  /*generated*/ packageHash?: string;
-  rollout?: number;
-  holdDurationMinutes?: number;
-  rampDurationMinutes?: number;
-}
-
-/*out*/
-export interface UpdateCheckResponse extends PackageInfo {
-  target_binary_range?: string;
-  downloadURL?: string;
-  isAvailable: boolean;
-  packageSize?: number;
-  shouldRunBinaryVersion?: boolean;
-  updateAppVersion?: boolean;
-}
-
-/*out*/
-export interface UpdateCheckCacheResponse {
-  originalPackage: UpdateCheckResponse;
-  rollout?: number;
-  rolloutPackage?: UpdateCheckResponse;
-  rolloutHoldDurationMinutes?: number;
-  rolloutRampDurationMinutes?: number;
-  rolloutUploadTime?: number;
-}
-
-/*in*/
-export interface UpdateCheckRequest {
-  appVersion: string;
-  clientUniqueId?: string;
-  deploymentKey: string;
-  isCompanion?: boolean;
-  beta?: boolean;
-  label?: string;
-  packageHash?: string;
 }
 
 /*out*/
