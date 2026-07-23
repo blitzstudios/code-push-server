@@ -112,10 +112,17 @@ export function getHealthRouter(config: AcquisitionConfig): express.Router {
   const router: express.Router = express.Router();
 
   router.get("/health", (req: express.Request, res: express.Response, next: (err?: any) => void): any => {
+    // Storage is the source of truth and must be reachable to serve requests, so
+    // a storage failure is fatal (returns unhealthy and lets the load balancer
+    // pull this instance). Redis is a best-effort cache: if it's unreachable we
+    // can still serve update checks from storage, so treat it as degraded rather
+    // than failing the health check and taking every instance out of rotation.
     storage
       .checkHealth()
       .then(() => {
-        return redisManager.checkHealth();
+        return redisManager.checkHealth().catch((error: Error) => {
+          console.warn("Redis health check failed; serving in cache-degraded mode", error);
+        });
       })
       .then(() => {
         res.status(200).send("Healthy");

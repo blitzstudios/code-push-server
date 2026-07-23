@@ -25,12 +25,21 @@ export function createDiffMapFetcher(deploymentKey: string, redisManager: redis.
       return cachedPromise;
     }
 
-    return redisManager.getPackageDiffMap(deploymentKey, packageHash).then((diffMap) => {
-      const normalizedDiffMap = diffMap || null;
-      const resolvedPromise = q<PackageHashToBlobInfoMap>(normalizedDiffMap);
-      diffMapCache.set(cacheKey, resolvedPromise);
-      return normalizedDiffMap;
-    });
+    return redisManager
+      .getPackageDiffMap(deploymentKey, packageHash)
+      .then((diffMap) => {
+        const normalizedDiffMap = diffMap || null;
+        const resolvedPromise = q<PackageHashToBlobInfoMap>(normalizedDiffMap);
+        diffMapCache.set(cacheKey, resolvedPromise);
+        return normalizedDiffMap;
+      })
+      .catch((error: any): PackageHashToBlobInfoMap => {
+        // If Redis is unreachable, degrade gracefully: return no diff map so the
+        // client receives the full package instead of failing the update check.
+        // Don't cache the failure so it retries once Redis recovers.
+        console.warn("Failed to fetch diff package map from Redis", error);
+        return null;
+      });
   };
 }
 

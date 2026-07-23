@@ -112,6 +112,18 @@ export class RedisManager {
           // Note: Node defaults CA's to those trusted by Mozilla
           rejectUnauthorized: true,
         },
+        // Reject commands immediately when the connection is down instead of
+        // buffering them. Without this, node_redis queues commands and waits on
+        // the 1-hour default connect_timeout, so a Redis/network outage causes
+        // requests to hang for minutes. Combined with the fallbacks in the
+        // acquisition path, failing fast lets update checks be served from
+        // storage while Redis is unreachable.
+        enable_offline_queue: false,
+        // Reconnect forever with a capped backoff so the client self-heals as
+        // soon as Redis/the network recovers. Always returning a number (never
+        // an Error) keeps it retrying, and providing retry_strategy overrides
+        // the connect_timeout default that would otherwise give up mid-outage.
+        retry_strategy: (options: any): number => Math.min(1000 + options.attempt * 500, 5000),
       };
       this._opsClient = redis.createClient(redisConfig);
       this._metricsClient = redis.createClient(redisConfig);
@@ -125,9 +137,21 @@ export class RedisManager {
 
       this._promisifiedOpsClient = new PromisifiedRedisClient(this._opsClient);
       this._promisifiedMetricsClient = new PromisifiedRedisClient(this._metricsClient);
-      this._setupMetricsClientPromise = this._promisifiedMetricsClient
-        .select(RedisManager.METRICS_DB)
-        .then(() => this._promisifiedMetricsClient.set("health", "health"));
+
+      // Select the metrics DB on every (re)connect. node_redis re-issues queued
+      // SELECTs on reconnect, but with the offline queue disabled the initial
+      // select can be rejected before the socket is ready; doing it on "ready"
+      // guarantees metric writes target the correct DB and self-heal after an
+      // outage.
+      this._metricsClient.on("ready", () => {
+        this._metricsClient.select(RedisManager.METRICS_DB);
+      });
+
+      // Metrics are best-effort. Don't gate metric writes on a one-time setup
+      // promise: with fail-fast enabled, a failed initial connect would leave
+      // that promise permanently rejected and break metrics even after Redis
+      // recovered.
+      this._setupMetricsClientPromise = q<void>(null);
     } else {
       console.warn("No REDIS_HOST or REDIS_PORT environment variable configured.");
     }
