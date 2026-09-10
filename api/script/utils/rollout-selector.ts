@@ -26,10 +26,20 @@ function getHashCode(input: string): number {
   return hash;
 }
 
-export function isSelectedForRollout(clientId: string, rollout: number, releaseTag: string): boolean {
+export const ROLLOUT_BUCKET_COUNT = 100;
+
+/**
+ * The device's position in the rollout, 0-99. Salted with the release so a device
+ * that lands late in one rollout isn't late in every one.
+ */
+export function getRolloutBucket(clientId: string, releaseTag: string): number {
   const identifier: string = clientId + DELIMITER + releaseTag;
   const hashValue: number = getHashCode(identifier);
-  return Math.abs(hashValue) % 100 < rollout;
+  return Math.abs(hashValue) % ROLLOUT_BUCKET_COUNT;
+}
+
+export function isSelectedForRollout(clientId: string, rollout: number, releaseTag: string): boolean {
+  return getRolloutBucket(clientId, releaseTag) < rollout;
 }
 
 export function isUnfinishedRollout(rollout: number): boolean {

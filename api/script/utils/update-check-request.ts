@@ -11,6 +11,28 @@ export interface ParsedUpdateCheckRequest {
   rawAppVersion: string;
   normalizedAppVersion: string;
   isCompanion: boolean;
+  /**
+   * The client's own rollout bucket, 0-99, or null when it didn't send one.
+   * A client that supplies this lets the server decide rollout membership from
+   * the request alone, which makes the answer shareable by a CDN. Without it the
+   * bucket has to be derived from the device id and the answer is per-device.
+   */
+  rolloutBucket: number | null;
+}
+
+const ROLLOUT_BUCKET_COUNT = 100;
+
+function parseRolloutBucket(raw: unknown): number | null {
+  if (raw === undefined || raw === null || raw === "") {
+    return null;
+  }
+
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 0 || value >= ROLLOUT_BUCKET_COUNT) {
+    return null;
+  }
+
+  return value;
 }
 
 export function normalizeAppVersion(version: string): string {
@@ -40,6 +62,11 @@ export function buildUpdateCheckCacheKey(originalUrl: string, cacheSchema?: stri
   delete obj.query.beta;
   delete obj.query.package_hash;
   delete obj.query.label;
+  // Redis caches the release list, which the bucket has no bearing on — the bucket
+  // is applied afterwards when the response is built. Leaving it in would fragment
+  // this cache once per bucket for no benefit. The CDN key is the opposite case: it
+  // caches the finished response, so it must keep the bucket.
+  delete obj.query.rollout_bucket;
 
   const rawAppVersion = obj.query.app_version;
   if (rawAppVersion) {
@@ -62,6 +89,7 @@ export function parseUpdateCheckRequest(req: express.Request): ParsedUpdateCheck
   const rawAppVersion: string = String(req.query.app_version || "");
   const normalizedAppVersion: string = normalizeAppVersion(rawAppVersion);
   const isCompanion: boolean = String(req.query.is_companion || "").toLowerCase() === "true";
+  const rolloutBucket: number | null = parseRolloutBucket(req.query.rollout_bucket);
 
   return {
     deploymentKey,
@@ -72,6 +100,6 @@ export function parseUpdateCheckRequest(req: express.Request): ParsedUpdateCheck
     rawAppVersion,
     normalizedAppVersion,
     isCompanion,
+    rolloutBucket,
   };
 }
-

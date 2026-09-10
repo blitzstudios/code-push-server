@@ -21,14 +21,13 @@ export interface SendUpdateCheckOptions {
   normalizedAppVersion: string;
   isCompanion: boolean;
   diffMapFetcher: DiffMapFetcher;
+  /** The client's own rollout bucket, or null when it didn't send one. */
+  rolloutBucket: number | null;
   /** Set false for answers that don't reflect real deployment state. Defaults to true. */
   shareable?: boolean;
 }
 
-export function sendUpdateCheckResponse(
-  response: CacheableResponse,
-  options: SendUpdateCheckOptions
-): Promise<void> {
+export function sendUpdateCheckResponse(response: CacheableResponse, options: SendUpdateCheckOptions): Promise<void> {
   return q(
     buildUpdateCheckBody(
       response,
@@ -39,8 +38,9 @@ export function sendUpdateCheckResponse(
       options.rawAppVersion,
       options.normalizedAppVersion,
       options.isCompanion,
-      options.diffMapFetcher
-    )
+      options.diffMapFetcher,
+      options.rolloutBucket,
+    ),
   ).then(({ updateInfo, varyByClient }) => {
     options.res.locals.fromCache = options.fromCache;
 
@@ -52,10 +52,7 @@ export function sendUpdateCheckResponse(
     // revalidating exactly as they do today. Holding a copy on the device would delay a
     // release by the TTL a second time, on top of the edge's own window.
     const isShareable = options.shareable !== false && !varyByClient && UPDATECHECK_EDGE_TTL_SECONDS > 0;
-    options.res.setHeader(
-      "Cache-Control",
-      isShareable ? `public, s-maxage=${UPDATECHECK_EDGE_TTL_SECONDS}, max-age=0` : "no-store"
-    );
+    options.res.setHeader("Cache-Control", isShareable ? `public, s-maxage=${UPDATECHECK_EDGE_TTL_SECONDS}, max-age=0` : "no-store");
 
     options.res.status(response.statusCode).send(utils.convertObjectToSnakeCase({ updateInfo }));
   });

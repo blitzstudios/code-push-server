@@ -191,6 +191,7 @@ export function getAcquisitionRouter(config: AcquisitionConfig): express.Router 
       normalizedAppVersion: parsedRequest.normalizedAppVersion,
       isCompanion: parsedRequest.isCompanion,
       diffMapFetcher,
+      rolloutBucket: parsedRequest.rolloutBucket,
     };
 
     const memValue = updateCheckMicrocache.get(memCacheKey);

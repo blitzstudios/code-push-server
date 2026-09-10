@@ -24,7 +24,7 @@ function proxyBlobUrl(azureUrl: string): string {
 
     return newUrl.toString();
   } catch (error) {
-    console.warn('Failed to proxy blob URL:', error);
+    console.warn("Failed to proxy blob URL:", error);
     return azureUrl;
   }
 }
@@ -85,7 +85,7 @@ export function createUpdateInfoFromRelease(release: CachedRelease): UpdateCheck
 export function applyDiffPayload(
   updateInfo: UpdateCheckResponse,
   diffMap: PackageHashToBlobInfoMap | undefined,
-  requestPackageHash: string
+  requestPackageHash: string,
 ): void {
   if (!requestPackageHash || !diffMap) {
     return;
@@ -106,19 +106,23 @@ export function isClientPackage(release: CachedRelease, requestLabel: string, re
   return !!requestPackageHash && release.packageHash === requestPackageHash;
 }
 
-export function isClientSelectedForRollout(release: CachedRelease, clientUniqueId: string, releaseKey: string): boolean {
-  if (!clientUniqueId || release.rollout === undefined || release.rollout === null) {
-    return false;
-  }
-
-  const effectiveRollout = rolloutSelector.getEffectiveRollout({
+/** The rollout percentage in force right now, with the hold and ramp schedule applied. */
+export function getEffectiveRolloutForRelease(release: CachedRelease): number {
+  return rolloutSelector.getEffectiveRollout({
     rollout: release.rollout,
     holdDurationMinutes: release.rolloutHoldDurationMinutes,
     rampDurationMinutes: release.rolloutRampDurationMinutes,
     uploadTime: release.rolloutUploadTime,
   });
+}
 
-  return rolloutSelector.isSelectedForRollout(clientUniqueId, effectiveRollout, releaseKey);
+/** Fallback bucket for clients that don't send one. Returns null if we can't derive it. */
+function deriveRolloutBucket(clientUniqueId: string, release: CachedRelease): number | null {
+  if (!clientUniqueId) {
+    return null;
+  }
+
+  return rolloutSelector.getRolloutBucket(clientUniqueId, release.label || release.packageHash);
 }
 
 export function buildNoUpdateResponse(rawAppVersion: string, normalizedAppVersion: string): UpdateCheckResponse {
@@ -140,7 +144,8 @@ export async function buildUpdateCheckBody(
   rawAppVersion: string,
   normalizedAppVersion: string,
   requestIsCompanion: boolean,
-  diffMapFetcher: DiffMapFetcher
+  diffMapFetcher: DiffMapFetcher,
+  rolloutBucket: number | null,
 ): Promise<{ updateInfo: UpdateCheckResponse; varyByClient: boolean }> {
   const cachedResponseObject = <UpdateCheckCacheResponse>response.body;
   const releases = cachedResponseObject.releases || [];
@@ -162,14 +167,21 @@ export async function buildUpdateCheckBody(
 
     const isCurrentRelease = isClientPackage(release, requestLabel, requestPackageHash);
 
-      if (isCurrentRelease && release.isDisabled) {
+    if (isCurrentRelease && release.isDisabled) {
       continue;
     }
 
     if (isCurrentRelease) {
       if (selectedUpdate && selectedRelease) {
         await hydrateDiffPayloadForRelease(selectedUpdate, selectedRelease, requestPackageHash, diffMapFetcher);
-        return finalizeUpdateCheckResponse(selectedUpdate, selectedRelease, forceMandatory, rawAppVersion, normalizedAppVersion, varyByClient);
+        return finalizeUpdateCheckResponse(
+          selectedUpdate,
+          selectedRelease,
+          forceMandatory,
+          rawAppVersion,
+          normalizedAppVersion,
+          varyByClient,
+        );
       }
 
       const noUpdate = buildNoUpdateResponse(rawAppVersion, normalizedAppVersion);
@@ -196,19 +208,35 @@ export async function buildUpdateCheckBody(
       continue;
     }
 
-    const isRollout = rolloutSelector.isUnfinishedRollout(release.rollout);
+    // release.rollout is the percentage the release was published with and never
+    // moves; getEffectiveRollout applies the hold and ramp schedule on top of it.
+    // Cacheability has to follow the effective value, because a ramp that has
+    // reached 100 gives every device the same answer even though the stored value
+    // still looks partial. Nothing ever writes the stored value back to 100, so
+    // reading it here kept finished rollouts uncacheable indefinitely.
+    const effectiveRollout = getEffectiveRolloutForRelease(release);
     let updateInfo: UpdateCheckResponse = null;
 
-    if (!isRollout) {
+    if (effectiveRollout >= 100 || betaRequested) {
+      // Everyone is in, or this is a beta client, which is in regardless of its
+      // bucket. Beta is carried in the request, so neither answer depends on which
+      // device is asking.
       updateInfo = createUpdateInfoFromRelease(release);
-    } else {
-      // Rollout bucketing reads clientUniqueId, so from here the answer is
-      // specific to this device even when the beta flag short-circuits it.
-      varyByClient = true;
-      if (betaRequested || isClientSelectedForRollout(release, clientUniqueId, release.label || release.packageHash)) {
+    } else if (effectiveRollout > 0) {
+      const bucket = rolloutBucket === null ? deriveRolloutBucket(clientUniqueId, release) : rolloutBucket;
+
+      if (rolloutBucket === null) {
+        // The bucket had to come from the device id, so this answer is that
+        // device's alone and no shared cache may hold it.
+        varyByClient = true;
+      }
+
+      if (bucket !== null && bucket < effectiveRollout) {
         updateInfo = createUpdateInfoFromRelease(release);
       }
     }
+    // effectiveRollout <= 0 leaves updateInfo null: nobody is in yet, which is
+    // equally true for every device, so that answer stays shareable too.
 
     if (updateInfo) {
       selectedUpdate = updateInfo;
@@ -224,7 +252,14 @@ export async function buildUpdateCheckBody(
 
   if (selectedUpdate && selectedRelease) {
     await hydrateDiffPayloadForRelease(selectedUpdate, selectedRelease, requestPackageHash, diffMapFetcher);
-    return finalizeUpdateCheckResponse(selectedUpdate, selectedRelease, forceMandatory, rawAppVersion, normalizedAppVersion, varyByClient);
+    return finalizeUpdateCheckResponse(
+      selectedUpdate,
+      selectedRelease,
+      forceMandatory,
+      rawAppVersion,
+      normalizedAppVersion,
+      varyByClient,
+    );
   }
 
   const fallback = buildNoUpdateResponse(rawAppVersion, normalizedAppVersion);
@@ -236,7 +271,7 @@ async function hydrateDiffPayloadForRelease(
   updateInfo: UpdateCheckResponse,
   release: CachedRelease,
   requestPackageHash: string,
-  diffMapFetcher: DiffMapFetcher
+  diffMapFetcher: DiffMapFetcher,
 ): Promise<void> {
   if (!requestPackageHash || !release) {
     return;
@@ -258,7 +293,7 @@ function finalizeUpdateCheckResponse(
   forceMandatory: boolean,
   rawAppVersion: string,
   normalizedAppVersion: string,
-  varyByClient: boolean
+  varyByClient: boolean,
 ): { updateInfo: UpdateCheckResponse; varyByClient: boolean } {
   if (forceMandatory) {
     updateInfo.isMandatory = true;
@@ -270,4 +305,3 @@ function finalizeUpdateCheckResponse(
 
   return { updateInfo, varyByClient };
 }
-
