@@ -224,6 +224,43 @@ Query parameter *order* is not normalised: reordering the same parameters produc
 cache entry. The acquisition SDK emits them in a fixed order so this costs nothing in
 practice, and the failure mode is a lower hit rate rather than a wrong answer.
 
+## Rollouts decide how much of this actually helps
+
+A release publishes with `hold=120min, ramp=360min` by default, and pushes happen several
+times a day, so a rollout is active most of the time. That matters because a partial
+rollout buckets on the device id, which makes the answer per-device and therefore
+`no-store`. Three phases:
+
+| Phase | Effective rollout | Shareable |
+| --- | --- | --- |
+| Beta hold, first 2h | 0% — only beta clients, decided without the device id | Yes |
+| Ramp, next 6h | 0→100%, bucketed per device | **No**, unless the client sends `rollout_bucket` |
+| After ~8h | 100% — everyone gets the same answer | Yes |
+
+A release published with a percentage but **no** ramp duration never reaches 100 on its
+own, so it stays per-device until someone patches it to 100%.
+
+Two consequences worth planning around:
+
+- **Publishing within ~8 hours of a game leaves the origin exposed**, because the ramp will
+  still be running when the herd arrives. The cheapest mitigation is a pre-game release
+  freeze; no code required.
+- **`rollout_bucket` is what makes a live ramp cacheable.** The client computes its own
+  bucket and sends it, so the server never has to look at the device id. The
+  acquisition SDK builds this query in plain JavaScript that is bundled into the RN
+  bundle, so shipping it is a CodePush release rather than an App Store one.
+
+The client should derive the bucket from the device id salted with **its current label**:
+that keeps it stable for the duration of a rollout (a device's label doesn't change until
+it installs) while reshuffling the cohort every release, so the same users aren't
+permanently the canaries. Use 5% granularity — 20 buckets multiply the cache key space by
+20, and the hot set during a game is only a handful of base keys. Coarser distorts the
+ramp, because `bucket < rollout` rounds up: with 10% buckets an intended 5% rollout
+actually reaches 10% of devices.
+
+Clients that send nothing keep today's behaviour and get `no-store`, so adoption is
+incremental.
+
 ### Smart Tiered Cache is off
 
 Each Cloudflare PoP fetches independently, so origin load is roughly
