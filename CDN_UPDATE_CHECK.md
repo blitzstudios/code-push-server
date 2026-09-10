@@ -46,8 +46,10 @@ per device and caching does nothing.
 Correctness for the rollout case is enforced at the origin, not in Cloudflare config. The
 server now emits:
 
-- `Cache-Control: public, max-age=30` when the answer is determined entirely by the
-  parameters above.
+- `Cache-Control: public, s-maxage=30, max-age=0` when the answer is determined entirely by
+  the parameters above. `s-maxage` targets shared caches only; `max-age=0` keeps devices
+  revalidating exactly as they did before, so the edge window isn't stacked on top of a
+  second device-side window.
 - `Cache-Control: no-store` when a ramping rollout made the answer device-specific, and for
   degraded (storage-timeout) answers that don't reflect real deployment state.
 
@@ -155,12 +157,81 @@ curl -X POST \
 Rules in a phase evaluate in order and the last match wins, so confirm no later rule
 overrides these cache settings for the same path.
 
-`respect_origin` is what makes the origin's `max-age=30` / `no-store` authoritative, so a
+`respect_origin` is what makes the origin's `s-maxage=30` / `no-store` authoritative, so a
 ramping rollout bypasses the edge automatically.
 
 Everything else on `/v0.1/public/codepush/*` (the `report_status` endpoints) must route to
 the origin but stay **uncached** — they are POSTs and will not match this rule, but confirm
 no broader cache rule catches them.
+
+## Applied configuration (live as of 2026-09-10)
+
+Zone `sleepercdn.com` = `b368aa39131fc35a783ef36da8982570` (Enterprise).
+
+| Piece | Value |
+| --- | --- |
+| DNS `CNAME codepush-api` | → `codepush-sleeper.azurewebsites.net`, proxied |
+| DNS `TXT asuid.codepush-api` | Azure custom-domain ownership proof |
+| App Service hostname | `codepush-api.sleepercdn.com`, SNI SSL |
+| Certificate | App Service Managed, GeoTrust TLS RSA CA G1, expires 2027-03-10 |
+| Cache rule | ruleset `ed50c5861deb45f39d0a3ef09eb931d0`, rule appended 6th of 6 |
+| Config rule | ruleset `38b6f85ca3fb467696a6cc699cc91727`, rule `71bda9865fcc46699e396d0da6075548` |
+
+### The zone is on Flexible SSL, and must stay that way
+
+Cloudflare connects to origins over plain HTTP on this zone. That is not an oversight:
+`codepush.sleepercdn.com` is a custom domain on Azure Blob Storage, and Blob Storage only
+serves its own `*.blob.core.windows.net` certificate, so a custom domain cannot terminate
+HTTPS at that origin. Switching the zone to Full (strict) would break bundle downloads.
+
+App Service has `httpsOnly: true`, so with Flexible the origin answered every proxied
+request with a 301 to the same URL and clients looped forever. The fix is a **Configuration
+Rule** scoping `ssl: strict` to this one hostname, leaving the rest of the zone on Flexible:
+
+```bash
+curl -X PUT \
+  "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/rulesets/phases/http_config_settings/entrypoint" \
+  -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" \
+  -d '{"rules":[{
+    "description": "Full (strict) TLS to the CodePush API origin only.",
+    "expression": "(http.host eq \"codepush-api.sleepercdn.com\")",
+    "action": "set_config",
+    "action_parameters": { "ssl": "strict" },
+    "enabled": true
+  }]}'
+```
+
+This needs `Config Rules:Edit` on the API token, which is separate from `Cache Rules:Edit`.
+
+### Verification results
+
+Run against the live edge on 2026-09-10, comparing every answer against origin truth:
+
+| Test | Result |
+| --- | --- |
+| Repeat request | `MISS` → `HIT` → `HIT` |
+| Three distinct `client_unique_id` | All `HIT`, identical body — one origin fetch serves every device |
+| Two different `deployment_key` | Separate entries, each got its own correct body |
+| `package_hash` present vs absent | Separate entries, correct bodies (diff bundles safe) |
+| `label` v763 vs v700 | Separate entries, correct bodies |
+| `app_version` 151.1 vs 150.0 | Separate entries, correct bodies |
+| 400 malformed request | `BYPASS`, not cached |
+| `report_status` POST | `DYNAMIC`, not cached |
+| TTL | `age: 0` → `age: 10` → `EXPIRED` at 30s |
+| 200 unique devices | 199 `HIT`, 1 `MISS` — **99% of requests never reached the origin** |
+
+Query parameter *order* is not normalised: reordering the same parameters produces a second
+cache entry. The acquisition SDK emits them in a fixed order so this costs nothing in
+practice, and the failure mode is a lower hit rate rather than a wrong answer.
+
+### Smart Tiered Cache is off
+
+Each Cloudflare PoP fetches independently, so origin load is roughly
+`distinct keys × active PoPs × (60 / TTL)` per minute rather than `distinct keys × 2`.
+With ~287 keys that is still a large reduction, but enabling Smart Tiered Cache would
+collapse it further by having lower-tier PoPs fetch from an upper tier. It is a zone-wide
+setting, so it also affects blob downloads — likely to help them too, but it should be
+changed deliberately rather than as part of this work.
 
 ## Alternatives (not needed on Enterprise)
 
