@@ -22,7 +22,17 @@ export interface ParsedUpdateCheckRequest {
 
 const ROLLOUT_BUCKET_COUNT = 100;
 
+// Set to "false" to ignore the bucket the client sends and derive it from the device id
+// instead. The bucket is what makes a partial rollout's answer shareable, so turning this
+// off costs edge caching during a ramp, but it is the only way to stop trusting the value
+// without waiting for a client release to roll out.
+const UPDATECHECK_TRUST_CLIENT_ROLLOUT_BUCKET: boolean = process.env.UPDATECHECK_TRUST_CLIENT_ROLLOUT_BUCKET !== "false";
+
 function parseRolloutBucket(raw: unknown): number | null {
+  if (!UPDATECHECK_TRUST_CLIENT_ROLLOUT_BUCKET) {
+    return null;
+  }
+
   if (raw === undefined || raw === null || raw === "") {
     return null;
   }
