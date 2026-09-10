@@ -16,12 +16,7 @@ import * as validationUtils from "../utils/validation";
 import * as q from "q";
 import Promise = q.Promise;
 import { Microcache } from "../utils/microcache";
-import {
-  ParsedUpdateCheckRequest,
-  buildUpdateCheckCacheKey,
-  normalizeAppVersion,
-  parseUpdateCheckRequest,
-} from "../utils/update-check-request";
+import { ParsedUpdateCheckRequest, buildUpdateCheckCacheKey, parseUpdateCheckRequest } from "../utils/update-check-request";
 import { createDiffMapFetcher, primeDiffCacheForReleases } from "../utils/diff-cache";
 import { SendUpdateCheckOptions, sendUpdateCheckResponse } from "../utils/update-check-response";
 
@@ -47,31 +42,23 @@ export interface AcquisitionConfig {
   redisManager: redis.RedisManager;
 }
 
+// Takes the already-parsed request rather than re-reading req.query. Parsing it twice
+// let the two copies disagree: the cache key and the rendered response saw one request
+// while the storage lookup saw another, so a request spelled the wrong way could pass
+// validation here and still render as an empty answer.
 function createResponseUsingStorage(
-  req: express.Request,
+  parsedRequest: ParsedUpdateCheckRequest,
   res: express.Response,
   storage: storageTypes.Storage,
   redisManager: redis.RedisManager
 ): Promise<redis.CacheableResponse> {
-  const deploymentKey: string = String(req.query.deploymentKey || req.query.deployment_key);
-  const appVersion: string = String(req.query.appVersion || req.query.app_version);
-  const packageHash: string = String(req.query.packageHash || req.query.package_hash);
-  const isCompanion: string = String(req.query.isCompanion || req.query.is_companion);
-
   const updateRequest: UpdateCheckRequest = {
-    deploymentKey: deploymentKey,
-    appVersion: appVersion,
-    packageHash: packageHash,
-    isCompanion: isCompanion && isCompanion.toLowerCase() === "true",
-    label: String(req.query.label),
+    deploymentKey: parsedRequest.deploymentKey,
+    appVersion: parsedRequest.normalizedAppVersion,
+    packageHash: parsedRequest.requestPackageHash,
+    isCompanion: parsedRequest.isCompanion,
+    label: parsedRequest.requestLabel,
   };
-
-  let originalAppVersion: string | undefined;
-  const normalizedAppVersion = normalizeAppVersion(updateRequest.appVersion);
-  if (normalizedAppVersion !== updateRequest.appVersion) {
-    originalAppVersion = updateRequest.appVersion;
-    updateRequest.appVersion = normalizedAppVersion;
-  }
 
   if (validationUtils.isValidUpdateCheckRequest(updateRequest)) {
     return storage.getPackageHistoryFromDeploymentKey(updateRequest.deploymentKey).then((packageHistory: storageTypes.Package[]) => {
@@ -89,7 +76,9 @@ function createResponseUsingStorage(
         body: updateObject,
       };
 
-      return primeDiffCacheForReleases(deploymentKey, updateObject.releases, packageLookup, redisManager).then(() => cacheableResponse);
+      return primeDiffCacheForReleases(updateRequest.deploymentKey, updateObject.releases, packageLookup, redisManager).then(
+        () => cacheableResponse
+      );
     });
   } else {
     if (!validationUtils.isValidKeyField(updateRequest.deploymentKey)) {
@@ -224,7 +213,7 @@ export function getAcquisitionRouter(config: AcquisitionConfig): express.Router 
           return q<redis.CacheableResponse>(cachedResponse);
         }
 
-        return createResponseUsingStorage(req, res, storage, redisManager)
+        return createResponseUsingStorage(parsedRequest, res, storage, redisManager)
           .timeout(UPDATECHECK_STORAGE_TIMEOUT_MS, "updateCheck storage lookup timed out")
           .catch((error: any): redis.CacheableResponse => {
             // createResponseUsingStorage answers malformed requests itself.
