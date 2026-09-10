@@ -5,6 +5,11 @@ import * as utils from "./common";
 import { CacheableResponse } from "../redis-manager";
 import { DiffMapFetcher, buildUpdateCheckBody } from "./acquisition";
 
+// How long a shared cache (CDN edge) may hold an update check answer. Matches the
+// in-process microcache window, so the edge never serves anything staler than an
+// instance already would. Set to 0 to keep update checks off the edge entirely.
+const UPDATECHECK_EDGE_TTL_SECONDS: number = Number(process.env.UPDATECHECK_EDGE_TTL_SECONDS) || 30;
+
 export interface SendUpdateCheckOptions {
   res: express.Response;
   newApi: boolean;
@@ -17,6 +22,8 @@ export interface SendUpdateCheckOptions {
   normalizedAppVersion: string;
   isCompanion: boolean;
   diffMapFetcher: DiffMapFetcher;
+  /** Set false for answers that don't reflect real deployment state. Defaults to true. */
+  shareable?: boolean;
 }
 
 export function sendUpdateCheckResponse(
@@ -35,10 +42,21 @@ export function sendUpdateCheckResponse(
       options.isCompanion,
       options.diffMapFetcher
     )
-  ).then((updateCheckBody) => {
+  ).then(({ updateInfo, varyByClient }) => {
     options.res.locals.fromCache = options.fromCache;
-    const payload = options.newApi ? utils.convertObjectToSnakeCase(updateCheckBody) : updateCheckBody;
+
+    // A shared cache may only hold answers that are fully determined by the
+    // request parameters. A ramping rollout buckets on the device id, so those
+    // answers belong to one client only. This overrides the blanket no-cache set
+    // by the headers middleware.
+    const isShareable = options.shareable !== false && !varyByClient && UPDATECHECK_EDGE_TTL_SECONDS > 0;
+    options.res.setHeader(
+      "Cache-Control",
+      isShareable ? `public, max-age=${UPDATECHECK_EDGE_TTL_SECONDS}` : "no-store"
+    );
+
+    const body = { updateInfo };
+    const payload = options.newApi ? utils.convertObjectToSnakeCase(body) : body;
     options.res.status(response.statusCode).send(payload);
   });
 }
-

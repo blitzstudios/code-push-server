@@ -87,3 +87,4 @@ To enable KeyVault credential resolution, set:
 To proxy update check URLs through a CDN or proxy service:
 
 - `UPDATE_CHECK_PROXY_URL`: The base URL to use for proxying update check responses. For example, if set to "https://yourcdn.com/" Azure blob storage URLs will be transformed to use this domain instead.
+- `UPDATECHECK_EDGE_TTL_SECONDS` (Optional): How long a shared cache may hold an update check answer, in seconds. Defaults to 30. Answers that depend on the requesting device — those decided by an in-progress rollout — are always sent as `no-store` regardless of this value. Set to 0 to keep update checks off the edge entirely.

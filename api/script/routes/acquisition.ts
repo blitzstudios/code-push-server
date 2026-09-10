@@ -248,7 +248,7 @@ export function getAcquisitionRouter(config: AcquisitionConfig): express.Router 
             return q<void>(null);
           }
 
-          return sendUpdateCheckResponse(response, { ...responseOptionsBase, fromCache })
+          return sendUpdateCheckResponse(response, { ...responseOptionsBase, fromCache, shareable: !degraded })
             .then(() => {
               // A degraded answer isn't the real state of the deployment, so it
               // must not reach either cache tier.

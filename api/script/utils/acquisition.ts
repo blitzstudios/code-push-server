@@ -141,7 +141,7 @@ export async function buildUpdateCheckBody(
   normalizedAppVersion: string,
   requestIsCompanion: boolean,
   diffMapFetcher: DiffMapFetcher
-): Promise<{ updateInfo: UpdateCheckResponse }> {
+): Promise<{ updateInfo: UpdateCheckResponse; varyByClient: boolean }> {
   const cachedResponseObject = <UpdateCheckCacheResponse>response.body;
   const releases = cachedResponseObject.releases || [];
 
@@ -149,6 +149,11 @@ export async function buildUpdateCheckBody(
   let selectedRelease: CachedRelease = null;
   let forceMandatory: boolean = false;
   let pendingMandatory: boolean = false;
+  // Set once the answer depends on which device is asking, which only happens
+  // while a rollout is still ramping. Everything else about the response is
+  // determined by request parameters, so callers use this to decide whether a
+  // shared cache is allowed to hold it.
+  let varyByClient: boolean = false;
 
   for (const release of releases) {
     if (!release) {
@@ -164,12 +169,12 @@ export async function buildUpdateCheckBody(
     if (isCurrentRelease) {
       if (selectedUpdate && selectedRelease) {
         await hydrateDiffPayloadForRelease(selectedUpdate, selectedRelease, requestPackageHash, diffMapFetcher);
-        return finalizeUpdateCheckResponse(selectedUpdate, selectedRelease, forceMandatory, rawAppVersion, normalizedAppVersion);
+        return finalizeUpdateCheckResponse(selectedUpdate, selectedRelease, forceMandatory, rawAppVersion, normalizedAppVersion, varyByClient);
       }
 
       const noUpdate = buildNoUpdateResponse(rawAppVersion, normalizedAppVersion);
       noUpdate.target_binary_range = noUpdate.appVersion;
-      return { updateInfo: noUpdate };
+      return { updateInfo: noUpdate, varyByClient };
     }
 
     if (release.isDisabled) {
@@ -196,8 +201,13 @@ export async function buildUpdateCheckBody(
 
     if (!isRollout) {
       updateInfo = createUpdateInfoFromRelease(release);
-    } else if (betaRequested || isClientSelectedForRollout(release, clientUniqueId, release.label || release.packageHash)) {
-      updateInfo = createUpdateInfoFromRelease(release);
+    } else {
+      // Rollout bucketing reads clientUniqueId, so from here the answer is
+      // specific to this device even when the beta flag short-circuits it.
+      varyByClient = true;
+      if (betaRequested || isClientSelectedForRollout(release, clientUniqueId, release.label || release.packageHash)) {
+        updateInfo = createUpdateInfoFromRelease(release);
+      }
     }
 
     if (updateInfo) {
@@ -214,12 +224,12 @@ export async function buildUpdateCheckBody(
 
   if (selectedUpdate && selectedRelease) {
     await hydrateDiffPayloadForRelease(selectedUpdate, selectedRelease, requestPackageHash, diffMapFetcher);
-    return finalizeUpdateCheckResponse(selectedUpdate, selectedRelease, forceMandatory, rawAppVersion, normalizedAppVersion);
+    return finalizeUpdateCheckResponse(selectedUpdate, selectedRelease, forceMandatory, rawAppVersion, normalizedAppVersion, varyByClient);
   }
 
   const fallback = buildNoUpdateResponse(rawAppVersion, normalizedAppVersion);
   fallback.target_binary_range = fallback.appVersion;
-  return { updateInfo: fallback };
+  return { updateInfo: fallback, varyByClient };
 }
 
 async function hydrateDiffPayloadForRelease(
@@ -247,8 +257,9 @@ function finalizeUpdateCheckResponse(
   release: CachedRelease,
   forceMandatory: boolean,
   rawAppVersion: string,
-  normalizedAppVersion: string
-): { updateInfo: UpdateCheckResponse } {
+  normalizedAppVersion: string,
+  varyByClient: boolean
+): { updateInfo: UpdateCheckResponse; varyByClient: boolean } {
   if (forceMandatory) {
     updateInfo.isMandatory = true;
   }
@@ -257,6 +268,6 @@ function finalizeUpdateCheckResponse(
   updateInfo.target_binary_range = clientVersion;
   updateInfo.appVersion = clientVersion;
 
-  return { updateInfo };
+  return { updateInfo, varyByClient };
 }
 
