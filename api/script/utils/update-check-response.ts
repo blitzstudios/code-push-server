@@ -48,10 +48,13 @@ export function sendUpdateCheckResponse(
     // request parameters. A ramping rollout buckets on the device id, so those
     // answers belong to one client only. This overrides the blanket no-cache set
     // by the headers middleware.
+    // s-maxage rather than max-age: this is aimed at the CDN, and devices should keep
+    // revalidating exactly as they do today. Holding a copy on the device would delay a
+    // release by the TTL a second time, on top of the edge's own window.
     const isShareable = options.shareable !== false && !varyByClient && UPDATECHECK_EDGE_TTL_SECONDS > 0;
     options.res.setHeader(
       "Cache-Control",
-      isShareable ? `public, max-age=${UPDATECHECK_EDGE_TTL_SECONDS}` : "no-store"
+      isShareable ? `public, s-maxage=${UPDATECHECK_EDGE_TTL_SECONDS}, max-age=0` : "no-store"
     );
 
     options.res.status(response.statusCode).send(utils.convertObjectToSnakeCase({ updateInfo }));
