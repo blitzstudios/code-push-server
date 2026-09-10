@@ -66,24 +66,97 @@ caching entirely — a single app-setting change is enough to take the edge out 
   disabled (`clientAffinityEnabled: false`) — it was useless for a stateless API and was
   also skewing load distribution.
 
-## Choosing an implementation
+## Implementation: Enterprise custom cache key
 
-Cloudflare's default cache key includes the **full query string**, and `client_unique_id` is
-in it. That has to be dealt with, and how depends on your plan.
+`sleepercdn.com` is on Enterprise, so this is a Cache Rule with a custom cache key. No
+Worker, no per-request cost, nothing to maintain.
 
-### Option A — Enterprise custom cache key (simplest, no code)
+Cloudflare's default cache key is the **full query string**, which includes
+`client_unique_id` and would give one cache entry per device. The custom key has to remove
+it.
 
-Cache Rules let Enterprise zones set a custom cache key. Create a rule matching the
-update-check path with:
+### Exclude the device id, don't include an allowlist
 
-- **Cache eligibility:** Eligible for cache
-- **Edge TTL:** Respect origin (so `max-age`/`no-store` drive behaviour)
-- **Cache key → Query string:** *Include only* `deployment_key`, `app_version`, `label`,
-  `package_hash`, `beta`, `is_companion`
+Cloudflare offers both `include` (keep only the listed params) and `exclude` (keep
+everything except the listed params). **Use `exclude`.**
 
-No Worker, no per-request cost, nothing to maintain.
+`parseUpdateCheckRequest` accepts *both* spellings of every parameter —
+`deploymentKey` or `deployment_key`, `appVersion` or `app_version`, `packageHash` or
+`package_hash`, `isCompanion` or `is_companion`. Production clients currently send only
+snake_case, but an allowlist that misses a spelling silently **drops that parameter from the
+cache key**. Dropping `deploymentKey` would serve one deployment's answer to another.
 
-### Option B — Move `client_unique_id` to a header (cheapest without Enterprise)
+The two approaches fail in very different ways:
+
+| Approach | Failure mode if a param is missed |
+| --- | --- |
+| `include` allowlist | Param drops out of the key — **wrong answer served** |
+| `exclude` denylist | Param stays in the key — lower hit rate, still correct |
+
+Excluding only the device id also yields exactly the cardinality measured above (~287
+entries), because `client_unique_id` is the only per-device parameter.
+
+### The rule
+
+**Append, do not replace.** A `PUT` to a phase entrypoint overwrites *every* rule in that
+phase, which would remove the cache rules already fronting blob downloads on this zone.
+Inspect first, then `POST` a single rule.
+
+```bash
+ZONE_ID=<sleepercdn.com zone id>
+
+# 1. What is already in the cache phase?
+curl -s \
+  "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/rulesets/phases/http_request_cache_settings/entrypoint" \
+  -H "Authorization: Bearer $CF_API_TOKEN" \
+  | jq '{ruleset: .result.id, rules: [.result.rules[]? | {description, expression}]}'
+```
+
+If that returns 404 the phase has no ruleset yet, and a `PUT` with a `"rules": [...]` array
+is the way to create it. Otherwise take the ruleset id and append:
+
+```bash
+# 2. Append the update_check rule.
+RULESET_ID=<ruleset id from step 1>
+
+curl -X POST \
+  "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/rulesets/$RULESET_ID/rules" \
+  -H "Authorization: Bearer $CF_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "description": "Cache CodePush update_check, keyed without the device id",
+    "expression": "(http.host eq \"codepush-api.sleepercdn.com\" and starts_with(http.request.uri.path, \"/v0.1/public/codepush/update_check\"))",
+    "action": "set_cache_settings",
+    "action_parameters": {
+      "cache": true,
+      "edge_ttl":    { "mode": "respect_origin" },
+      "browser_ttl": { "mode": "respect_origin" },
+      "cache_key": {
+        "custom_key": {
+          "query_string": {
+            "exclude": { "list": ["client_unique_id", "clientUniqueId"] }
+          }
+        }
+      }
+    }
+  }'
+```
+
+Rules in a phase evaluate in order and the last match wins, so confirm no later rule
+overrides these cache settings for the same path.
+
+`respect_origin` is what makes the origin's `max-age=30` / `no-store` authoritative, so a
+ramping rollout bypasses the edge automatically.
+
+Everything else on `/v0.1/public/codepush/*` (the `report_status` endpoints) must route to
+the origin but stay **uncached** — they are POSTs and will not match this rule, but confirm
+no broader cache rule catches them.
+
+## Alternatives (not needed on Enterprise)
+
+Recorded in case the zone or plan changes.
+
+### Move `client_unique_id` to a header
 
 You own the client fork (`blitzstudios/react-native-code-push`), so the device id can be
 sent as a request header instead of a query parameter, with the server reading the header
@@ -94,7 +167,7 @@ The remaining query string is then *exactly* the correct cache key, so a plain C
 
 Costs one client change plus a few lines on the server, and then has zero ongoing cost.
 
-### Option C — Worker that normalises the cache key (works on any plan)
+### Worker that normalises the cache key (works on any plan)
 
 Be aware Workers bill per request, cached or not. At roughly 170M update checks/day this is
 on the order of **$1.3–1.5k/month**, comparable to the App Service bill — so prefer A or B
@@ -174,10 +247,17 @@ Note the CodePush client sends `report_status/deploy`, `report_status/download` 
    in that deployment, expect `no-store`.
 3. Stand up the hostname and cache rule. Verify `cf-cache-status` goes `MISS` then `HIT`,
    and that two requests differing **only** by `client_unique_id` both hit.
-4. Verify a device on the newest label still gets `isAvailable: false` and that a device on
-   an older label gets a diff URL whose hash matches its own — this is the case a wrong
-   cache key would break.
-5. Ship the client pointing at the new hostname. Origin request rate should fall by orders
+4. Verify the cache key still separates what it must. These are the cases a wrong key
+   breaks, in descending order of severity:
+   - Two different `deployment_key` values must **never** share an entry. Request each and
+     confirm the payloads differ. This is the one that would serve one app another app's
+     bundle.
+   - A device on the newest label gets `isAvailable: false`, while a device on an older
+     label gets an update whose diff URL matches its own `package_hash`.
+   - Two different `app_version` values return their own `target_binary_range`.
+5. Confirm a deployment with an in-progress rollout returns `Cache-Control: no-store` and
+   reports `cf-cache-status: BYPASS`, so rollout bucketing is never shared between devices.
+6. Ship the client pointing at the new hostname. Origin request rate should fall by orders
    of magnitude; watch `Requests` on the App Service plan.
 
 ## Caveats
