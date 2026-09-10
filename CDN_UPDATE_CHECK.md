@@ -57,7 +57,14 @@ behaviour instead of being silently wrong.
 The TTL is controlled by `UPDATECHECK_EDGE_TTL_SECONDS` (default 30, `0` disables edge
 caching entirely — a single app-setting change is enough to take the edge out of the path).
 
-## Prerequisites (both done)
+## Prerequisites (all done)
+
+- **camelCase query parameters.** The server used to accept `deploymentKey` alongside
+  `deployment_key` (and so on for every parameter). Nothing sent them — zero occurrences in
+  870M requests over 31 days — but while the origin still honoured them, a request could
+  reach the origin carrying a parameter the cache key didn't see. Removed, along with the
+  unused legacy `/updateCheck` route (40 hits in 31 days, all from one 10-minute manual
+  session, all using snake_case).
 
 - **`Cache-Control: no-cache` on every response.** `routes/headers.ts` set this globally;
   `sendUpdateCheckResponse` now overrides it per response.
@@ -77,24 +84,27 @@ it.
 
 ### Exclude the device id, don't include an allowlist
 
+The server reads exactly six query parameters, all snake_case: `deployment_key`,
+`app_version`, `label`, `package_hash`, `is_companion`, `beta`, plus `client_unique_id`.
+(Support for camelCase spellings was removed — it was dead, with zero occurrences across
+870M requests in 31 days.)
+
 Cloudflare offers both `include` (keep only the listed params) and `exclude` (keep
-everything except the listed params). **Use `exclude`.**
+everything except the listed params). Either is correct today. **Use `exclude`**, because
+the two fail differently as the API evolves:
 
-`parseUpdateCheckRequest` accepts *both* spellings of every parameter —
-`deploymentKey` or `deployment_key`, `appVersion` or `app_version`, `packageHash` or
-`package_hash`, `isCompanion` or `is_companion`. Production clients currently send only
-snake_case, but an allowlist that misses a spelling silently **drops that parameter from the
-cache key**. Dropping `deploymentKey` would serve one deployment's answer to another.
-
-The two approaches fail in very different ways:
-
-| Approach | Failure mode if a param is missed |
+| Approach | If a parameter is added later and the rule isn't updated |
 | --- | --- |
-| `include` allowlist | Param drops out of the key — **wrong answer served** |
-| `exclude` denylist | Param stays in the key — lower hit rate, still correct |
+| `include` allowlist | New param drops out of the key — **wrong answer served**, silently |
+| `exclude` denylist | New param stays in the key — lower hit rate, still correct |
 
-Excluding only the device id also yields exactly the cardinality measured above (~287
-entries), because `client_unique_id` is the only per-device parameter.
+An allowlist has to be kept in sync with the server forever, and the penalty for forgetting
+is serving one client another client's answer. A denylist only has to name the parameters
+that are per-device, and forgetting shows up as a hit-rate regression in metrics rather
+than as incorrect updates.
+
+`client_unique_id` is the only per-device parameter, so excluding it alone yields exactly
+the ~287 entry cardinality measured above.
 
 ### The rule
 
@@ -134,7 +144,7 @@ curl -X POST \
       "cache_key": {
         "custom_key": {
           "query_string": {
-            "exclude": { "list": ["client_unique_id", "clientUniqueId"] }
+            "exclude": { "list": ["client_unique_id"] }
           }
         }
       }

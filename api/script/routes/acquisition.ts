@@ -181,97 +181,94 @@ export function getAcquisitionRouter(config: AcquisitionConfig): express.Router 
   const redisManager: redis.RedisManager = config.redisManager;
   const router: express.Router = express.Router();
 
-  const updateCheck = function (newApi: boolean) {
-    return function (req: express.Request, res: express.Response, next: (err?: any) => void) {
-      const parsedRequest: ParsedUpdateCheckRequest = parseUpdateCheckRequest(req);
-      const deploymentKey: string = parsedRequest.deploymentKey;
-      const key: string = redis.Utilities.getDeploymentKeyHash(deploymentKey);
-      const url: string = buildUpdateCheckCacheKey(req.originalUrl, UPDATECHECK_CACHE_SCHEMA_VERSION);
-      const memCacheKey: string = key + "|" + url;
-      let fromCache: boolean = true;
-      let degraded: boolean = false;
-      let redisError: Error;
-      const diffMapFetcher = createDiffMapFetcher(deploymentKey, redisManager);
+  const updateCheck = function (req: express.Request, res: express.Response, next: (err?: any) => void) {
+    const parsedRequest: ParsedUpdateCheckRequest = parseUpdateCheckRequest(req);
+    const deploymentKey: string = parsedRequest.deploymentKey;
+    const key: string = redis.Utilities.getDeploymentKeyHash(deploymentKey);
+    const url: string = buildUpdateCheckCacheKey(req.originalUrl, UPDATECHECK_CACHE_SCHEMA_VERSION);
+    const memCacheKey: string = key + "|" + url;
+    let fromCache: boolean = true;
+    let degraded: boolean = false;
+    let redisError: Error;
+    const diffMapFetcher = createDiffMapFetcher(deploymentKey, redisManager);
 
-      const responseOptionsBase: Omit<SendUpdateCheckOptions, "fromCache"> = {
-        res,
-        newApi,
-        clientUniqueId: parsedRequest.clientUniqueId,
-        betaRequested: parsedRequest.betaRequested,
-        requestLabel: parsedRequest.requestLabel,
-        requestPackageHash: parsedRequest.requestPackageHash,
-        rawAppVersion: parsedRequest.rawAppVersion,
-        normalizedAppVersion: parsedRequest.normalizedAppVersion,
-        isCompanion: parsedRequest.isCompanion,
-        diffMapFetcher,
-      };
-
-      const memValue = updateCheckMicrocache.get(memCacheKey);
-      if (memValue) {
-        sendUpdateCheckResponse(memValue, { ...responseOptionsBase, fromCache: true })
-          .catch((error: any) => next(error));
-        return;
-      }
-
-      redisManager
-        .getCachedResponse(key, url)
-        .catch((error: Error) => {
-          // Store the redis error to be thrown after we send response.
-          redisError = error;
-          return q<redis.CacheableResponse>(null);
-        })
-        .then((cachedResponse: redis.CacheableResponse) => {
-          fromCache = !!cachedResponse;
-          if (cachedResponse) {
-            return q<redis.CacheableResponse>(cachedResponse);
-          }
-
-          return createResponseUsingStorage(req, res, storage, redisManager)
-            .timeout(UPDATECHECK_STORAGE_TIMEOUT_MS, "updateCheck storage lookup timed out")
-            .catch((error: any): redis.CacheableResponse => {
-              // createResponseUsingStorage answers malformed requests itself.
-              if (res.headersSent) {
-                return null;
-              }
-
-              // "No update available" is safe and idempotent: the client walks
-              // into the app and picks the release up on its next check. The
-              // alternative is a failed startup, which users resolve by
-              // force-quitting and relaunching straight back into this path.
-              console.warn("updateCheck storage lookup failed; serving no-update response", error);
-              degraded = true;
-              return { statusCode: 200, body: { releases: [] } };
-            });
-        })
-        .then((response: redis.CacheableResponse) => {
-          if (!response) {
-            return q<void>(null);
-          }
-
-          return sendUpdateCheckResponse(response, { ...responseOptionsBase, fromCache, shareable: !degraded })
-            .then(() => {
-              // A degraded answer isn't the real state of the deployment, so it
-              // must not reach either cache tier.
-              if (degraded) {
-                return;
-              }
-
-              updateCheckMicrocache.set(memCacheKey, response);
-              if (!fromCache) {
-                return redisManager.setCachedResponse(key, url, response).catch((error: any) => {
-                  console.warn("Failed to set updateCheck cache", error);
-                });
-              }
-            });
-        })
-        .then(() => {
-          if (redisError) {
-            console.warn("Redis cache error in updateCheck", redisError);
-          }
-        })
-        .catch((error: storageTypes.StorageError) => errorUtils.restErrorHandler(res, error, next))
-        .done();
+    const responseOptionsBase: Omit<SendUpdateCheckOptions, "fromCache"> = {
+      res,
+      clientUniqueId: parsedRequest.clientUniqueId,
+      betaRequested: parsedRequest.betaRequested,
+      requestLabel: parsedRequest.requestLabel,
+      requestPackageHash: parsedRequest.requestPackageHash,
+      rawAppVersion: parsedRequest.rawAppVersion,
+      normalizedAppVersion: parsedRequest.normalizedAppVersion,
+      isCompanion: parsedRequest.isCompanion,
+      diffMapFetcher,
     };
+
+    const memValue = updateCheckMicrocache.get(memCacheKey);
+    if (memValue) {
+      sendUpdateCheckResponse(memValue, { ...responseOptionsBase, fromCache: true })
+        .catch((error: any) => next(error));
+      return;
+    }
+
+    redisManager
+      .getCachedResponse(key, url)
+      .catch((error: Error) => {
+        // Store the redis error to be thrown after we send response.
+        redisError = error;
+        return q<redis.CacheableResponse>(null);
+      })
+      .then((cachedResponse: redis.CacheableResponse) => {
+        fromCache = !!cachedResponse;
+        if (cachedResponse) {
+          return q<redis.CacheableResponse>(cachedResponse);
+        }
+
+        return createResponseUsingStorage(req, res, storage, redisManager)
+          .timeout(UPDATECHECK_STORAGE_TIMEOUT_MS, "updateCheck storage lookup timed out")
+          .catch((error: any): redis.CacheableResponse => {
+            // createResponseUsingStorage answers malformed requests itself.
+            if (res.headersSent) {
+              return null;
+            }
+
+            // "No update available" is safe and idempotent: the client walks
+            // into the app and picks the release up on its next check. The
+            // alternative is a failed startup, which users resolve by
+            // force-quitting and relaunching straight back into this path.
+            console.warn("updateCheck storage lookup failed; serving no-update response", error);
+            degraded = true;
+            return { statusCode: 200, body: { releases: [] } };
+          });
+      })
+      .then((response: redis.CacheableResponse) => {
+        if (!response) {
+          return q<void>(null);
+        }
+
+        return sendUpdateCheckResponse(response, { ...responseOptionsBase, fromCache, shareable: !degraded })
+          .then(() => {
+            // A degraded answer isn't the real state of the deployment, so it
+            // must not reach either cache tier.
+            if (degraded) {
+              return;
+            }
+
+            updateCheckMicrocache.set(memCacheKey, response);
+            if (!fromCache) {
+              return redisManager.setCachedResponse(key, url, response).catch((error: any) => {
+                console.warn("Failed to set updateCheck cache", error);
+              });
+            }
+          });
+      })
+      .then(() => {
+        if (redisError) {
+          console.warn("Redis cache error in updateCheck", redisError);
+        }
+      })
+      .catch((error: storageTypes.StorageError) => errorUtils.restErrorHandler(res, error, next))
+      .done();
   };
 
   const reportStatusDeploy = function (req: express.Request, res: express.Response, next: (err?: any) => void) {
@@ -373,8 +370,7 @@ export function getAcquisitionRouter(config: AcquisitionConfig): express.Router 
       .done();
   };
 
-  router.get("/updateCheck", updateCheck(false));
-  router.get("/v0.1/public/codepush/update_check", updateCheck(true));
+  router.get("/v0.1/public/codepush/update_check", updateCheck);
 
   router.post("/reportStatus/deploy", reportStatusDeploy);
   router.post("/v0.1/public/codepush/report_status/deploy", reportStatusDeploy);

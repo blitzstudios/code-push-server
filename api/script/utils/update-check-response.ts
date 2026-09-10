@@ -12,7 +12,6 @@ const UPDATECHECK_EDGE_TTL_SECONDS: number = Number(process.env.UPDATECHECK_EDGE
 
 export interface SendUpdateCheckOptions {
   res: express.Response;
-  newApi: boolean;
   fromCache: boolean;
   clientUniqueId: string;
   betaRequested: boolean;
@@ -55,8 +54,6 @@ export function sendUpdateCheckResponse(
       isShareable ? `public, max-age=${UPDATECHECK_EDGE_TTL_SECONDS}` : "no-store"
     );
 
-    const body = { updateInfo };
-    const payload = options.newApi ? utils.convertObjectToSnakeCase(body) : body;
-    options.res.status(response.statusCode).send(payload);
+    options.res.status(response.statusCode).send(utils.convertObjectToSnakeCase({ updateInfo }));
   });
 }

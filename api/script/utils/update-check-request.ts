@@ -36,22 +36,14 @@ export function normalizeAppVersion(version: string): string {
 
 export function buildUpdateCheckCacheKey(originalUrl: string, cacheSchema?: string): string {
   const obj: any = URL.parse(originalUrl, /*parseQueryString*/ true);
-  delete obj.query.clientUniqueId;
   delete obj.query.client_unique_id;
   delete obj.query.beta;
-  delete obj.query.packageHash;
   delete obj.query.package_hash;
   delete obj.query.label;
 
-  const rawAppVersion = obj.query.appVersion || obj.query.app_version;
+  const rawAppVersion = obj.query.app_version;
   if (rawAppVersion) {
-    const normalizedAppVersion = normalizeAppVersion(String(rawAppVersion));
-    if (obj.query.appVersion) {
-      obj.query.appVersion = normalizedAppVersion;
-    }
-    if (obj.query.app_version) {
-      obj.query.app_version = normalizedAppVersion;
-    }
+    obj.query.app_version = normalizeAppVersion(String(rawAppVersion));
   }
 
   if (cacheSchema) {
@@ -62,14 +54,14 @@ export function buildUpdateCheckCacheKey(originalUrl: string, cacheSchema?: stri
 }
 
 export function parseUpdateCheckRequest(req: express.Request): ParsedUpdateCheckRequest {
-  const deploymentKey: string = String(req.query.deploymentKey || req.query.deployment_key || "");
-  const clientUniqueId: string = String(req.query.clientUniqueId || req.query.client_unique_id || "");
+  const deploymentKey: string = String(req.query.deployment_key || "");
+  const clientUniqueId: string = String(req.query.client_unique_id || "");
   const betaRequested: boolean = String(req.query.beta).toLowerCase() === "true";
   const requestLabel: string = String(req.query.label || "");
-  const requestPackageHash: string = String(req.query.packageHash || req.query.package_hash || "");
-  const rawAppVersion: string = String(req.query.appVersion || req.query.app_version || "");
+  const requestPackageHash: string = String(req.query.package_hash || "");
+  const rawAppVersion: string = String(req.query.app_version || "");
   const normalizedAppVersion: string = normalizeAppVersion(rawAppVersion);
-  const isCompanion: boolean = String(req.query.isCompanion || req.query.is_companion || "").toLowerCase() === "true";
+  const isCompanion: boolean = String(req.query.is_companion || "").toLowerCase() === "true";
 
   return {
     deploymentKey,
