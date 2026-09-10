@@ -33,6 +33,15 @@ const UPDATECHECK_MEM_TTL_MS: number = Number(process.env.UPDATECHECK_MEM_TTL_MS
 const updateCheckMicrocache = new Microcache<redis.CacheableResponse>(UPDATECHECK_MEM_TTL_MS);
 const UPDATECHECK_CACHE_SCHEMA_VERSION = "v2";
 
+// Upper bound on the storage lookup behind a cache miss. Clients block app
+// startup on this call, so a slow lookup has to become a cheap "no update"
+// answer rather than a hung request the user resolves by force-quitting.
+const UPDATECHECK_STORAGE_TIMEOUT_MS: number = Number(process.env.UPDATECHECK_STORAGE_TIMEOUT_MS) || 10000;
+
+const HEALTH_PROBE_INTERVAL_MS: number = Number(process.env.HEALTH_PROBE_INTERVAL_MS) || 15000;
+const HEALTH_PROBE_TIMEOUT_MS: number = Number(process.env.HEALTH_PROBE_TIMEOUT_MS) || 5000;
+const HEALTH_FAILURE_THRESHOLD: number = Number(process.env.HEALTH_FAILURE_THRESHOLD) || 3;
+
 export interface AcquisitionConfig {
   storage: storageTypes.Storage;
   redisManager: redis.RedisManager;
@@ -111,24 +120,57 @@ export function getHealthRouter(config: AcquisitionConfig): express.Router {
   const redisManager: redis.RedisManager = config.redisManager;
   const router: express.Router = express.Router();
 
-  router.get("/health", (req: express.Request, res: express.Response, next: (err?: any) => void): any => {
-    // Storage is the source of truth and must be reachable to serve requests, so
-    // a storage failure is fatal (returns unhealthy and lets the load balancer
-    // pull this instance). Redis is a best-effort cache: if it's unreachable we
-    // can still serve update checks from storage, so treat it as degraded rather
-    // than failing the health check and taking every instance out of rotation.
+  // Storage is the source of truth and must be reachable to serve requests, so
+  // sustained storage failure is fatal (returns unhealthy and lets the load
+  // balancer pull this instance). Redis is a best-effort cache: if it's
+  // unreachable we can still serve update checks from storage, so treat it as
+  // degraded rather than failing the health check and taking every instance out
+  // of rotation.
+  //
+  // The probe runs on a timer rather than inside the request handler. Doing the
+  // storage round trip per request couples liveness to whatever is slowing the
+  // instance down, so a fleet-wide stall fails every probe at once and the
+  // instances that are still serving from cache get pulled along with the rest.
+  // Reading a cached verdict keeps /health O(1), and requiring consecutive
+  // failures stops one slow round trip from evicting a healthy instance.
+  let consecutiveStorageFailures: number = 0;
+  let lastStorageError: Error = null;
+
+  const probeStorage = (): void => {
     storage
       .checkHealth()
+      .timeout(HEALTH_PROBE_TIMEOUT_MS, "Storage health check timed out")
       .then(() => {
-        return redisManager.checkHealth().catch((error: Error) => {
-          console.warn("Redis health check failed; serving in cache-degraded mode", error);
-        });
+        consecutiveStorageFailures = 0;
+        lastStorageError = null;
+      })
+      .catch((error: Error) => {
+        consecutiveStorageFailures++;
+        lastStorageError = error;
+        console.warn(`Storage health probe failed (${consecutiveStorageFailures} consecutive)`, error);
       })
       .then(() => {
-        res.status(200).send("Healthy");
+        return redisManager
+          .checkHealth()
+          .timeout(HEALTH_PROBE_TIMEOUT_MS, "Redis health check timed out")
+          .catch((error: Error) => {
+            console.warn("Redis health check failed; serving in cache-degraded mode", error);
+          });
       })
-      .catch((error: Error) => errorUtils.sendUnknownError(res, error, next))
       .done();
+  };
+
+  probeStorage();
+  const probeTimer = setInterval(probeStorage, HEALTH_PROBE_INTERVAL_MS);
+  probeTimer.unref();
+
+  router.get("/health", (req: express.Request, res: express.Response, next: (err?: any) => void): any => {
+    if (consecutiveStorageFailures >= HEALTH_FAILURE_THRESHOLD) {
+      errorUtils.sendUnknownError(res, lastStorageError || new Error("Storage is unreachable"), next);
+      return;
+    }
+
+    res.status(200).send("Healthy");
   });
 
   return router;
@@ -147,6 +189,7 @@ export function getAcquisitionRouter(config: AcquisitionConfig): express.Router 
       const url: string = buildUpdateCheckCacheKey(req.originalUrl, UPDATECHECK_CACHE_SCHEMA_VERSION);
       const memCacheKey: string = key + "|" + url;
       let fromCache: boolean = true;
+      let degraded: boolean = false;
       let redisError: Error;
       const diffMapFetcher = createDiffMapFetcher(deploymentKey, redisManager);
 
@@ -179,7 +222,26 @@ export function getAcquisitionRouter(config: AcquisitionConfig): express.Router 
         })
         .then((cachedResponse: redis.CacheableResponse) => {
           fromCache = !!cachedResponse;
-          return cachedResponse || createResponseUsingStorage(req, res, storage, redisManager);
+          if (cachedResponse) {
+            return q<redis.CacheableResponse>(cachedResponse);
+          }
+
+          return createResponseUsingStorage(req, res, storage, redisManager)
+            .timeout(UPDATECHECK_STORAGE_TIMEOUT_MS, "updateCheck storage lookup timed out")
+            .catch((error: any): redis.CacheableResponse => {
+              // createResponseUsingStorage answers malformed requests itself.
+              if (res.headersSent) {
+                return null;
+              }
+
+              // "No update available" is safe and idempotent: the client walks
+              // into the app and picks the release up on its next check. The
+              // alternative is a failed startup, which users resolve by
+              // force-quitting and relaunching straight back into this path.
+              console.warn("updateCheck storage lookup failed; serving no-update response", error);
+              degraded = true;
+              return { statusCode: 200, body: { releases: [] } };
+            });
         })
         .then((response: redis.CacheableResponse) => {
           if (!response) {
@@ -188,6 +250,12 @@ export function getAcquisitionRouter(config: AcquisitionConfig): express.Router 
 
           return sendUpdateCheckResponse(response, { ...responseOptionsBase, fromCache })
             .then(() => {
+              // A degraded answer isn't the real state of the deployment, so it
+              // must not reach either cache tier.
+              if (degraded) {
+                return;
+              }
+
               updateCheckMicrocache.set(memCacheKey, response);
               if (!fromCache) {
                 return redisManager.setCachedResponse(key, url, response).catch((error: any) => {
