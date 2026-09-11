@@ -10,6 +10,15 @@ import { DiffMapFetcher, buildUpdateCheckBody } from "./acquisition";
 // instance already would. Set to 0 to keep update checks off the edge entirely.
 const UPDATECHECK_EDGE_TTL_SECONDS: number = Number(process.env.UPDATECHECK_EDGE_TTL_SECONDS) || 30;
 
+// Grace window where the edge may serve the expired answer while it refetches behind the
+// request. Without it, everything queued at a PoP races the origin the instant the TTL
+// lapses. Costs up to this many extra seconds before a release is visible.
+const UPDATECHECK_EDGE_STALE_SECONDS: number = Number(process.env.UPDATECHECK_EDGE_STALE_SECONDS) || 30;
+
+// Serving a slightly stale answer beats surfacing a 5xx to the client, which is the whole
+// failure mode we're guarding against.
+const UPDATECHECK_EDGE_STALE_ERROR_SECONDS: number = Number(process.env.UPDATECHECK_EDGE_STALE_ERROR_SECONDS) || 600;
+
 export interface SendUpdateCheckOptions {
   res: express.Response;
   fromCache: boolean;
@@ -52,7 +61,14 @@ export function sendUpdateCheckResponse(response: CacheableResponse, options: Se
     // revalidating exactly as they do today. Holding a copy on the device would delay a
     // release by the TTL a second time, on top of the edge's own window.
     const isShareable = options.shareable !== false && !varyByClient && UPDATECHECK_EDGE_TTL_SECONDS > 0;
-    options.res.setHeader("Cache-Control", isShareable ? `public, s-maxage=${UPDATECHECK_EDGE_TTL_SECONDS}, max-age=0` : "no-store");
+    const directives = [`public`, `s-maxage=${UPDATECHECK_EDGE_TTL_SECONDS}`, `max-age=0`];
+    if (UPDATECHECK_EDGE_STALE_SECONDS > 0) {
+      directives.push(`stale-while-revalidate=${UPDATECHECK_EDGE_STALE_SECONDS}`);
+    }
+    if (UPDATECHECK_EDGE_STALE_ERROR_SECONDS > 0) {
+      directives.push(`stale-if-error=${UPDATECHECK_EDGE_STALE_ERROR_SECONDS}`);
+    }
+    options.res.setHeader("Cache-Control", isShareable ? directives.join(", ") : "no-store");
 
     options.res.status(response.statusCode).send(utils.convertObjectToSnakeCase({ updateInfo }));
   });
