@@ -9,6 +9,7 @@ import * as express from "express";
 import * as fs from "fs";
 import * as hashUtils from "../script/utils/hash-utils";
 import * as http from "http";
+import * as os from "os";
 import * as packageDiffing from "../script/utils/package-diffing";
 import * as path from "path";
 import * as q from "q";
@@ -506,3 +507,261 @@ function packageDiffTests(StorageType: new (...args: any[]) => storage.Storage):
     throw new Error("Expected the promise to be rejected, but it succeeded with value " + (result ? JSON.stringify(result) : result));
   }
 }
+
+// Releases usually touch the same few files, so diffing several of them against one release
+// produces the same archive over and over. These tests pin down that the differ builds each
+// distinct archive once and still hands every history entry a diff. Unlike the
+// generateDiffPackageMap suite above this needs no Azure, because the differ only has to read
+// the release and manifests over HTTP and say how many archives it uploaded.
+describe("Package diffing deduplication", () => {
+  const PORT: number = 3001;
+  const BASE_URL: string = "http://localhost:" + PORT;
+
+  // Hashes of the files inside test.zip, which holds exactly b.txt, c.txt and d.txt.
+  const HASH_B = "3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d";
+  const HASH_C = "2e7d2c03a9507ae265ecf5b5356885a53393a2029d241394997265a1a25aefc6";
+  const HASH_D = "18ac3e7343f016890c510e93f935261169d9e3f565436429830faf0934f4f8e4";
+
+  interface Committed {
+    account: storage.Account;
+    app: storage.App;
+    deployment: storage.Deployment;
+    oldPackages: storage.Package[];
+    newPackage: storage.Package;
+  }
+
+  // Counts archive uploads and hands back a distinct URL per upload. JsonStorage cannot be used
+  // for this directly because it accumulates blobs into a string, which mangles zip bytes.
+  class UploadCountingStorage extends JsonStorage {
+    public uploadedBlobIds: string[] = [];
+
+    public addBlob(blobId: string, blobStream: stream.Readable, streamLength: number): Promise<string> {
+      this.uploadedBlobIds.push(blobId);
+
+      return Promise<string>((resolve: (blobId: string) => void): void => {
+        blobStream.on("data", (): void => undefined).on("end", (): void => resolve(blobId));
+      });
+    }
+
+    public getBlobUrl(blobId: string): Promise<string> {
+      return q(BASE_URL + "/blobs/" + blobId);
+    }
+  }
+
+  var server: http.Server;
+  var storageInstance: UploadCountingStorage;
+  var differ: PackageDiffer;
+  var servedManifests: { [name: string]: string } = {};
+
+  before(() => {
+    var app = express();
+    app.use("/resources", express.static(path.join(__dirname, "resources")));
+    app.get("/manifests/:name", (req: express.Request, res: express.Response) => {
+      res.type("text/plain").send(servedManifests[req.params.name] || "");
+    });
+
+    server = app.listen(PORT);
+  });
+
+  after(() => {
+    server.close();
+  });
+
+  function distinct<T>(values: T[]): T[] {
+    var seen: T[] = [];
+    values.forEach((value: T) => {
+      if (seen.indexOf(value) < 0) {
+        seen.push(value);
+      }
+    });
+
+    return seen;
+  }
+
+  function serveManifest(prefix: string, map: Map<string, string>): string {
+    var name: string = prefix + "_" + shortid.generate() + ".json";
+    servedManifests[name] = new PackageManifest(map).serialize();
+
+    return BASE_URL + "/manifests/" + name;
+  }
+
+  // Commits one package per supplied manifest, then a release whose contents are test.zip.
+  function setUpDeployment(oldManifestMaps: Map<string, string>[]): Promise<Committed> {
+    storageInstance = new UploadCountingStorage();
+    differ = new PackageDiffer(storageInstance, /*maxPackagesToDiff*/ oldManifestMaps.length);
+
+    var result = <Committed>{ oldPackages: [] };
+    result.account = utils.makeAccount();
+
+    return storageInstance
+      .addAccount(result.account)
+      .then((accountId: string) => {
+        result.account.id = accountId;
+        result.app = utils.makeStorageApp();
+        return storageInstance.addApp(accountId, result.app);
+      })
+      .then((addedApp: storage.App) => {
+        result.app.id = addedApp.id;
+        result.deployment = utils.makeStorageDeployment();
+        return storageInstance.addDeployment(result.account.id, result.app.id, result.deployment);
+      })
+      .then((deploymentId: string) => {
+        result.deployment.id = deploymentId;
+
+        // Commit sequentially so history order matches release order.
+        var chain: Promise<void> = q<void>(null);
+        oldManifestMaps.forEach((map: Map<string, string>, index: number) => {
+          chain = chain.then(() => {
+            var oldPackage: storage.Package = utils.makePackage("1.0.0", false, "oldhash" + index);
+            oldPackage.blobUrl = BASE_URL + "/resources/test.zip";
+            oldPackage.manifestBlobUrl = serveManifest("old" + index, map);
+
+            return storageInstance
+              .commitPackage(result.account.id, result.app.id, result.deployment.id, oldPackage)
+              .then((committedPackage: storage.Package) => {
+                oldPackage.label = committedPackage.label;
+                result.oldPackages.push(oldPackage);
+              });
+          });
+        });
+
+        return chain;
+      })
+      .then(() => {
+        var newPackage: storage.Package = utils.makePackage("1.0.0", false, "newhash");
+        newPackage.blobUrl = BASE_URL + "/resources/test.zip";
+        newPackage.manifestBlobUrl = serveManifest(
+          "new",
+          new Map<string, string>().set("b.txt", HASH_B).set("c.txt", HASH_C).set("d.txt", HASH_D)
+        );
+
+        return storageInstance
+          .commitPackage(result.account.id, result.app.id, result.deployment.id, newPackage)
+          .then((committedPackage: storage.Package) => {
+            newPackage.label = committedPackage.label;
+            result.newPackage = newPackage;
+            return result;
+          });
+      });
+  }
+
+  function generateMap(committed: Committed): Promise<storage.PackageHashToBlobInfoMap> {
+    return differ.generateDiffPackageMap(committed.account.id, committed.app.id, committed.deployment.id, committed.newPackage);
+  }
+
+  // Differs from the release in c.txt alone, so the diff holds c.txt plus the manifest.
+  function changedCOnly(staleHash: string): Map<string, string> {
+    return new Map<string, string>().set("b.txt", HASH_B).set("c.txt", staleHash).set("d.txt", HASH_D);
+  }
+
+  it("builds a single archive when several history entries produce the same diff", (done) => {
+    var oldManifests: Map<string, string>[] = [changedCOnly("stale1"), changedCOnly("stale2"), changedCOnly("stale3")];
+
+    var committed: Committed;
+    setUpDeployment(oldManifests)
+      .then((result: Committed) => {
+        committed = result;
+        return generateMap(committed);
+      })
+      .done((diffPackageMap: storage.PackageHashToBlobInfoMap) => {
+        assert(diffPackageMap, "expected a diff package map");
+
+        // Every history entry must still be offered a diff.
+        assert.equal(Object.keys(diffPackageMap).length, oldManifests.length);
+        committed.oldPackages.forEach((oldPackage: storage.Package) => {
+          assert(diffPackageMap[oldPackage.packageHash], "no diff for " + oldPackage.packageHash);
+        });
+
+        // ...but the identical archive is only built and uploaded once.
+        assert.equal(storageInstance.uploadedBlobIds.length, 1);
+
+        var urls: string[] = committed.oldPackages.map((oldPackage: storage.Package) => diffPackageMap[oldPackage.packageHash].url);
+        assert.equal(distinct(urls).length, 1, "identical diffs should share one blob");
+
+        var sizes: number[] = committed.oldPackages.map((oldPackage: storage.Package) => diffPackageMap[oldPackage.packageHash].size);
+        assert.equal(distinct(sizes).length, 1);
+
+        done();
+      }, done);
+  });
+
+  it("keeps archives separate when history entries produce different diffs", (done) => {
+    var oldManifests: Map<string, string>[] = [
+      changedCOnly("stale"),
+      // Never had d.txt, so the diff carries d.txt instead of c.txt.
+      new Map<string, string>().set("b.txt", HASH_B).set("c.txt", HASH_C),
+      // Differs in b.txt and holds a file the release dropped, so the manifest differs too.
+      new Map<string, string>().set("b.txt", "stale").set("c.txt", HASH_C).set("d.txt", HASH_D).set("gone.txt", "stale"),
+    ];
+
+    var committed: Committed;
+    setUpDeployment(oldManifests)
+      .then((result: Committed) => {
+        committed = result;
+        return generateMap(committed);
+      })
+      .done((diffPackageMap: storage.PackageHashToBlobInfoMap) => {
+        assert(diffPackageMap, "expected a diff package map");
+        assert.equal(Object.keys(diffPackageMap).length, oldManifests.length);
+        assert.equal(storageInstance.uploadedBlobIds.length, oldManifests.length, "distinct diffs must not be merged");
+
+        var urls: string[] = committed.oldPackages.map((oldPackage: storage.Package) => diffPackageMap[oldPackage.packageHash].url);
+        assert.equal(distinct(urls).length, oldManifests.length);
+
+        done();
+      }, done);
+  });
+
+  // The release is unpacked to disk once per diff run, so a leak here would fill the host.
+  function countExtractionDirectories(): number {
+    var workDirectory: string = process.env.TEMP || process.env.TMPDIR || os.tmpdir();
+
+    return fs.readdirSync(workDirectory).filter((name: string) => name.indexOf("extracted_") === 0).length;
+  }
+
+  it("removes the unpacked release once the diffs are built", (done) => {
+    var before: number = countExtractionDirectories();
+
+    setUpDeployment([changedCOnly("stale1"), changedCOnly("stale2")])
+      .then((result: Committed) => generateMap(result))
+      .done(() => {
+        assert.equal(countExtractionDirectories(), before, "extraction directory was left behind");
+        done();
+      }, done);
+  });
+
+  it("collapses only the matching entries when diffs are mixed", (done) => {
+    // Three entries share a diff; the other two are unique. Five diffs, three archives.
+    var oldManifests: Map<string, string>[] = [
+      changedCOnly("stale1"),
+      new Map<string, string>().set("b.txt", HASH_B).set("c.txt", HASH_C),
+      changedCOnly("stale2"),
+      new Map<string, string>().set("b.txt", "stale").set("c.txt", HASH_C).set("d.txt", HASH_D).set("gone.txt", "stale"),
+      changedCOnly("stale3"),
+    ];
+
+    var committed: Committed;
+    setUpDeployment(oldManifests)
+      .then((result: Committed) => {
+        committed = result;
+        return generateMap(committed);
+      })
+      .done((diffPackageMap: storage.PackageHashToBlobInfoMap) => {
+        assert(diffPackageMap, "expected a diff package map");
+        assert.equal(Object.keys(diffPackageMap).length, 5);
+        assert.equal(storageInstance.uploadedBlobIds.length, 3);
+
+        var urls: string[] = committed.oldPackages.map((oldPackage: storage.Package) => diffPackageMap[oldPackage.packageHash].url);
+        assert.equal(distinct(urls).length, 3);
+
+        // The three c.txt-only entries are indexes 0, 2 and 4.
+        assert.equal(urls[0], urls[2]);
+        assert.equal(urls[0], urls[4]);
+        assert.notEqual(urls[0], urls[1]);
+        assert.notEqual(urls[0], urls[3]);
+        assert.notEqual(urls[1], urls[3]);
+
+        done();
+      }, done);
+  });
+});
