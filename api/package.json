@@ -8,6 +8,8 @@
     "start:env": "node -r dotenv/config ./bin/script/server.js dotenv_config_path=.env dotenv_config_silent=true",
     "clean": "rimraf bin",
     "build": "tsc && shx cp -r ./script/views ./bin/script",
+    "pretest": "npm run build && shx cp -r ./test/resources ./bin/test/",
+    "test": "mocha bin/test/converter.js bin/test/package-diffing.js bin/test/security.js --timeout 120000",
     "prettier": "prettier --write \"./**/*.ts\"",
     "lint": "npx eslint ./script/**/*.ts",
     "lint:fix": "npx eslint ./script/**/*.ts --fix"
@@ -65,6 +67,8 @@
     "@typescript-eslint/parser": "^6.0.0",
     "dotenv": "^16.0.3",
     "eslint": "^8.45.0",
+    "mocha": "^10.8.2",
+    "pend": "^1.2.0",
     "prettier": "^2.8.8",
     "rimraf": "^5.0.1",
     "shx": "^0.3.4",
