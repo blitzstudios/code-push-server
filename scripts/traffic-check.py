@@ -35,13 +35,12 @@ TOKEN = open(os.path.expanduser("~/.cf_token")).read().strip()
 # free canary for the whole operation.
 CANARY_KEY = "uploads/36b27faece683480f2863b9ac73f0280.webp"
 
-# Referers that legitimately embed Sleeper assets. Anything else pulling real
-# bandwidth is worth a look.
-KNOWN_GOOD = {
-    "", "(none)", "sleeper.com", "sleeper.app", "sleepercdn.com", "www.sleeper.com",
-    "dynasty-daddy.com", "flockfantasy.com", "www.fantasypros.com", "otcffb.com",
-    "www.fantasypoints.com", "www.firstdown.studio", "statchasers.com", "goat-lab.app",
-}
+# Referer checking is scoped to /uploads/ rather than the whole host. Everything the
+# abuse ever touched lived there, because that prefix is the only one a stranger can
+# write to. /content/ is player photos written by internal sync jobs, and a long tail
+# of fantasy-football sites hotlink those legitimately -- alerting on them is noise.
+UPLOADS_PREFIX = "/uploads/"
+KNOWN_GOOD = {"", "(none)", "sleeper.com", "sleeper.app", "sleepercdn.com", "www.sleeper.com"}
 # A stranger has to pull more than this before it counts as hotlinking rather than noise.
 REFERER_ALERT_GB_HR = 1.0
 
@@ -117,14 +116,17 @@ def check_hosts():
 
 def check_referers():
     rows = cf(("httpRequestsAdaptiveGroups", "sum_edgeResponseBytes_DESC", "clientRefererHost"),
-              f',clientRequestHTTPHost:"{BUCKET}"')
-    print(f"\n=== {BUCKET} referers (last {MINUTES} min)")
+              f',clientRequestHTTPHost:"{BUCKET}",clientRequestPath_like:"{UPLOADS_PREFIX}%"')
+    print(f"\n=== {BUCKET}{UPLOADS_PREFIX} referers (last {MINUTES} min)")
+    if not rows:
+        print("  (no traffic)")
+        return
     for r in rows[:10]:
         ref = r["dimensions"]["clientRefererHost"] or "(none)"
         gb = r["sum"]["edgeResponseBytes"] / 1e9 * PER_HOUR
         bad = ref not in KNOWN_GOOD and gb >= REFERER_ALERT_GB_HR
         if bad:
-            alerts.append(f"unrecognized referer {ref} pulling {gb:.2f} GB/hr")
+            alerts.append(f"unrecognized referer {ref} pulling {gb:.2f} GB/hr from {UPLOADS_PREFIX}")
         print(f"  {ref[:33]:<34} {r['count']:>11,} {gb:>7.2f} GB/hr"
               f"{'   <-- UNRECOGNIZED' if bad else ''}")
 
@@ -180,19 +182,43 @@ def check_new_shapes():
 
     scale = 4096 / len(prefixes)
     bare = [r for r in new if BARE_KEY.match(r[0])]
-    verbatim = [r for r in new if r[0].endswith(VERBATIM_EXTENSIONS) and r[1] > OVERSIZE_BYTES]
+    oversized = [r for r in new if r[0].endswith(VERBATIM_EXTENSIONS) and r[1] > OVERSIZE_BYTES]
+    # Size alone says nothing -- people upload real videos. The bypass worth catching is
+    # a forged ftyp box wrapping something that is not media, so require the container to
+    # actually contain media atoms before treating it as ordinary.
+    forged = [r for r in oversized if not looks_like_real_media(r[0])]
+
     print(f"\n=== new objects in the last 6h ({len(prefixes)}/4096 of keyspace)")
     print(f"  total new           : {len(new):>5}  -> ~{int(len(new)*scale):,} fleet-wide")
     print(f"  extensionless       : {len(bare):>5}  (abuse shape; expected 0)")
-    print(f"  oversized .mp4/.aac : {len(verbatim):>5}  (verbatim path; skips re-encode)")
+    print(f"  oversized media     : {len(oversized):>5}  ({len(oversized)-len(forged)} verified real, "
+          f"{len(forged)} unverifiable)")
     if bare:
         alerts.append(f"{len(bare)} extensionless objects appeared - upload classification may have regressed")
         for k, s, lm in bare[:3]:
             print(f"     {lm[11:19]}  {s/1e6:.2f}MB  {k}")
-    if verbatim:
-        alerts.append(f"{len(verbatim)} oversized objects on the verbatim media path")
-        for k, s, lm in verbatim[:3]:
+    if forged:
+        alerts.append(f"{len(forged)} oversized objects claim a media container but hold no media atoms")
+        for k, s, lm in forged[:3]:
             print(f"     {lm[11:19]}  {s/1e6:.2f}MB  {k}")
+
+
+def looks_like_real_media(key):
+    """True when the file carries actual media structure, not just a valid-looking header.
+
+    A forged ftyp box costs eight bytes; a moov/trak/avc1 tree does not, so the atoms
+    are what separate a real upload from the verbatim-path bypass.
+    """
+    try:
+        req = urllib.request.Request(f"https://s3.amazonaws.com/{BUCKET}/{key}",
+                                     headers={"Range": "bytes=0-2047"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            head = r.read()
+    except Exception:
+        return False
+    if key.endswith(".aac"):
+        return head[:1] == b"\xff" and (head[1] & 0xF0) == 0xF0
+    return any(atom in head for atom in (b"moov", b"trak", b"mdia", b"avc1", b"mp4a"))
 
 
 def azure(args):
