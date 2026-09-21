@@ -9,8 +9,14 @@ const REQUEST_TIMEOUT_IN_MILLISECONDS: number = parseInt(process.env.REQUEST_TIM
 // storage, so they need far more room than an acquisition request that should answer in
 // milliseconds. Sharing one budget between the two means any value tight enough to shed a stalled
 // update_check is also tight enough to kill a healthy release.
+//
+// The window is bounded on both sides. Post-upload processing has been measured at 63s at the
+// worst across 81 releases, so anything near that kills healthy releases. App Service's front end
+// abandons a request at roughly 230s and answers the caller with a 502, so exceeding that hands
+// back the very error this timeout exists to replace. Staying under it keeps the failure ours to
+// report.
 const MANAGEMENT_REQUEST_TIMEOUT_IN_MILLISECONDS: number =
-  parseInt(process.env.MANAGEMENT_REQUEST_TIMEOUT_IN_MILLISECONDS) || 300000;
+  parseInt(process.env.MANAGEMENT_REQUEST_TIMEOUT_IN_MILLISECONDS) || 180000;
 
 export function RequestTimeoutHandler(
   timeoutInMilliseconds: number = REQUEST_TIMEOUT_IN_MILLISECONDS
