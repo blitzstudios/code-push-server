@@ -158,7 +158,14 @@ export function start(done: (err?: any, server?: express.Express, storage?: Stor
         } else {
           app.use(auth.router());
         }
-        app.use(auth.authenticate, fileUploadMiddleware, api.management({ storage: storage, redisManager: redisManager }));
+        // Re-arms the socket timeout with the management budget before the upload middleware
+        // starts draining the body, replacing the tighter acquisition value set above.
+        app.use(
+          api.managementRequestTimeoutHandler(),
+          auth.authenticate,
+          fileUploadMiddleware,
+          api.management({ storage: storage, redisManager: redisManager })
+        );
       } else {
         app.use(auth.legacyRouter());
       }

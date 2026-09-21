@@ -9,7 +9,7 @@ import { getManagementRouter, ManagementConfig } from "./routes/management";
 import { PassportAuthentication, AuthenticationConfig } from "./routes/passport-authentication";
 import { AppInsights } from "./routes/app-insights";
 import { InputSanitizer } from "./routes/input-sanitizer";
-import { RequestTimeoutHandler } from "./routes/request-timeout";
+import { RequestTimeoutHandler, MANAGEMENT_REQUEST_TIMEOUT_IN_MILLISECONDS } from "./routes/request-timeout";
 
 export function headers(config: HeadersConfig): RequestHandler {
   return getHeadersMiddleware(config);
@@ -49,6 +49,10 @@ export function inputSanitizer(): any {
   return InputSanitizer;
 }
 
-export function requestTimeoutHandler(): RequestHandler {
-  return RequestTimeoutHandler;
+export function requestTimeoutHandler(timeoutInMilliseconds?: number): RequestHandler {
+  return RequestTimeoutHandler(timeoutInMilliseconds);
+}
+
+export function managementRequestTimeoutHandler(): RequestHandler {
+  return RequestTimeoutHandler(MANAGEMENT_REQUEST_TIMEOUT_IN_MILLISECONDS);
 }
