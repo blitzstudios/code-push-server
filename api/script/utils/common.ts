@@ -29,15 +29,16 @@ export function convertObjectToSnakeCase(obj: any): any {
   }, {} as any);
 }
 
-export async function streamToBuffer(readableStream: Readable): Promise<ArrayBuffer> {
-  return new Promise<ArrayBuffer>((resolve, reject) => {
+// Resolves the Buffer itself rather than its `.buffer`: Node carves small Buffers out of a shared pool, so the backing
+// ArrayBuffer of one under 4 KB holds other allocations too, and uploading it stored 8 KB of unrelated bytes.
+export async function streamToBuffer(readableStream: Readable): Promise<Buffer> {
+  return new Promise<Buffer>((resolve, reject) => {
     streamToArray(readableStream, (err: Error | null, arr: Array<Buffer | Uint8Array>) => {
       if (err) {
         reject(err);
       } else {
         const buffers = arr.map((chunk) => (Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
-        const concatenatedBuffer = Buffer.concat(buffers);
-        resolve(concatenatedBuffer.buffer);
+        resolve(Buffer.concat(buffers));
       }
     });
   });
