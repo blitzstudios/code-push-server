@@ -22,6 +22,7 @@ import os
 import re
 import subprocess
 import sys
+import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -43,6 +44,15 @@ UPLOADS_PREFIX = "/uploads/"
 KNOWN_GOOD = {"", "(none)", "sleeper.com", "sleeper.app", "sleepercdn.com", "www.sleeper.com"}
 # A stranger has to pull more than this before it counts as hotlinking rather than noise.
 REFERER_ALERT_GB_HR = 1.0
+# The short window is only a detector. Legitimate fantasy sites are spiky -- fantasypros
+# averages 0.39 GB/hr across a week but peaks at 1.22, so any single half hour can cross
+# the line while the sustained draw is well under it. Confirm a suspect against its daily
+# rate before alerting, and judge it on the hours it was actually active so a newcomer
+# that has only been pulling for an hour is not averaged down to nothing by 23 idle ones.
+REFERER_CONFIRM_HOURS = 24
+# Above this there is nothing to confirm. Waiting a day to report a draw this large would
+# be the wrong trade, so it alerts off the short window alone.
+REFERER_BURST_GB_HR = 10.0
 
 # The abuse arrived as extensionless keys; the fix now derives the extension from
 # content, so any new one means uploads regressed. Oversized objects on the verbatim
@@ -64,6 +74,16 @@ PER_HOUR = 60 / MINUTES
 
 alerts = []
 
+# Set to a reason string once the token is known bad, so the Cloudflare sections report
+# one clear line instead of each raising its own traceback.
+cf_unavailable = None
+
+
+class CloudflareUnavailable(Exception):
+    """The token was rejected. Separate from a real failure because the token is
+    deliberately short-lived, so an expiry is routine maintenance rather than an
+    incident, and it must not take the origin and abuse checks down with it."""
+
 
 def graphql(query, variables):
     req = urllib.request.Request(
@@ -71,8 +91,26 @@ def graphql(query, variables):
         data=json.dumps({"query": query, "variables": variables}).encode(),
         headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=120) as r:
-        body = json.load(r)
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            body = json.load(r)
+    except urllib.error.HTTPError as error:
+        # An expired token answers 401, but a malformed one answers 400 with the complaint
+        # only in the body, so the status alone cannot tell a dead token from a bad query.
+        detail = ""
+        try:
+            detail = error.read().decode("utf-8", "replace")[:300]
+        except Exception:
+            pass
+        looks_like_auth = error.code in (401, 403) or (
+            error.code == 400
+            and any(w in detail.lower() for w in ("authent", "authoriz", "token", "request headers"))
+        )
+        if looks_like_auth:
+            raise CloudflareUnavailable(
+                f"token rejected with HTTP {error.code}; refresh ~/.cf_token"
+            ) from None
+        raise
     if body.get("errors"):
         print("  graphql error:", [e.get("message") for e in body["errors"]][:2])
     zones = (body.get("data") or {}).get("viewer", {}).get("zones") or [{}]
@@ -124,11 +162,46 @@ def check_referers():
     for r in rows[:10]:
         ref = r["dimensions"]["clientRefererHost"] or "(none)"
         gb = r["sum"]["edgeResponseBytes"] / 1e9 * PER_HOUR
-        bad = ref not in KNOWN_GOOD and gb >= REFERER_ALERT_GB_HR
-        if bad:
-            alerts.append(f"unrecognized referer {ref} pulling {gb:.2f} GB/hr from {UPLOADS_PREFIX}")
-        print(f"  {ref[:33]:<34} {r['count']:>11,} {gb:>7.2f} GB/hr"
-              f"{'   <-- UNRECOGNIZED' if bad else ''}")
+        note = ""
+        if ref not in KNOWN_GOOD and gb >= REFERER_ALERT_GB_HR:
+            if gb >= REFERER_BURST_GB_HR:
+                alerts.append(f"unrecognized referer {ref} pulling {gb:.2f} GB/hr from {UPLOADS_PREFIX}")
+                note = "   <-- UNRECOGNIZED (burst)"
+            else:
+                sustained = sustained_gb_hr(ref)
+                if sustained >= REFERER_ALERT_GB_HR:
+                    alerts.append(
+                        f"unrecognized referer {ref} sustaining {sustained:.2f} GB/hr "
+                        f"from {UPLOADS_PREFIX} over {REFERER_CONFIRM_HOURS}h"
+                    )
+                    note = f"   <-- UNRECOGNIZED ({sustained:.2f} GB/hr sustained)"
+                else:
+                    note = f"   (spike only; {sustained:.2f} GB/hr over {REFERER_CONFIRM_HOURS}h)"
+        print(f"  {ref[:33]:<34} {r['count']:>11,} {gb:>7.2f} GB/hr{note}")
+
+
+def sustained_gb_hr(referer):
+    """Mean GB/hr for one referer across the hours it actually pulled, over the last day.
+
+    Averaging over active hours rather than the whole day is what keeps this honest in both
+    directions: a steady site stays near its real rate, while something that only started an
+    hour ago is reported at full strength instead of being divided by a day of silence.
+    """
+    since = (NOW - timedelta(hours=REFERER_CONFIRM_HOURS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # A referer host is attacker-supplied, so it is escaped rather than interpolated raw.
+    q = """query($z:String!,$t0:Time!,$t1:Time!){viewer{zones(filter:{zoneTag:$z}){
+      httpRequestsAdaptiveGroups(limit:%d,filter:{datetime_geq:$t0,datetime_leq:$t1,
+        clientRequestHTTPHost:"%s",clientRequestPath_like:"%s%%",clientRefererHost:%s},
+        orderBy:[datetimeHour_ASC]){sum{edgeResponseBytes} dimensions{datetimeHour}}}}}""" % (
+        REFERER_CONFIRM_HOURS + 2, BUCKET, UPLOADS_PREFIX, json.dumps(referer))
+    try:
+        hours = graphql(q, {"z": ZONE, "t0": since, "t1": T1}).get("httpRequestsAdaptiveGroups") or []
+    except CloudflareUnavailable:
+        # The caller already has a reading worth showing; re-raising here would discard it.
+        return 0.0
+    if not hours:
+        return 0.0
+    return sum(h["sum"]["edgeResponseBytes"] for h in hours) / 1e9 / len(hours)
 
 
 def check_waf():
@@ -203,22 +276,45 @@ def check_new_shapes():
             print(f"     {lm[11:19]}  {s/1e6:.2f}MB  {k}")
 
 
+MEDIA_ATOMS = (b"moov", b"trak", b"mdia", b"avc1", b"mp4a")
+
+
 def looks_like_real_media(key):
     """True when the file carries actual media structure, not just a valid-looking header.
 
     A forged ftyp box costs eight bytes; a moov/trak/avc1 tree does not, so the atoms
     are what separate a real upload from the verbatim-path bypass.
+
+    Both ends are checked because where the index sits is an encoder choice, not a
+    validity signal: only "fast start" files move moov ahead of the media, and
+    everything else appends it once the sample sizes are known. Reading just the head
+    reports ordinary phone video as forged, which is how this flagged a clean 2.17MB
+    H.264/AAC upload whose moov began at byte 2,169,955.
     """
+    if key.endswith(".aac"):
+        # ADTS carries no index to go looking for; the sync word has to be at the front.
+        head = read_range(key, "bytes=0-7")
+        return len(head) >= 2 and head[0] == 0xFF and (head[1] & 0xF0) == 0xF0
+
+    if has_media_atoms(read_range(key, "bytes=0-2047")):
+        return True
+    # Second request, but only for the few objects the head cannot already clear.
+    return has_media_atoms(read_range(key, "bytes=-65536"))
+
+
+def has_media_atoms(chunk):
+    return any(atom in chunk for atom in MEDIA_ATOMS)
+
+
+def read_range(key, byte_range):
+    """Bytes for one HTTP range, or empty on any failure so callers stay on the strict side."""
     try:
         req = urllib.request.Request(f"https://s3.amazonaws.com/{BUCKET}/{key}",
-                                     headers={"Range": "bytes=0-2047"})
+                                     headers={"Range": byte_range})
         with urllib.request.urlopen(req, timeout=30) as r:
-            head = r.read()
+            return r.read()
     except Exception:
-        return False
-    if key.endswith(".aac"):
-        return head[:1] == b"\xff" and (head[1] & 0xF0) == 0xF0
-    return any(atom in head for atom in (b"moov", b"trak", b"mdia", b"avc1", b"mp4a"))
+        return b""
 
 
 def azure(args):
@@ -260,11 +356,26 @@ def check_origin():
                 alerts.append(f"{total:,.0f} 5xx in the last hour")
 
 
+def run_cloudflare_checks():
+    """Run the CDN sections, abandoning all of them together if the token is rejected.
+
+    Stops at the first rejection rather than retrying per section, because one bad token
+    fails every query and repeating it just prints the same thing three times.
+    """
+    global cf_unavailable
+
+    for check in (check_hosts, check_referers, check_waf):
+        try:
+            check()
+        except CloudflareUnavailable as error:
+            cf_unavailable = str(error)
+            print(f"\n=== CDN sections skipped: {error}")
+            return
+
+
 def main():
     print(f"traffic check @ {T1}   window {MINUTES} min{'  (deep)' if DEEP else ''}\n")
-    check_hosts()
-    check_referers()
-    check_waf()
+    run_cloudflare_checks()
     check_canary()
     check_new_shapes()
     check_origin()
@@ -274,9 +385,21 @@ def main():
         print("ALERT")
         for a in alerts:
             print(f"  - {a}")
+    elif cf_unavailable:
+        # Not "all clear": hotlinking and edge-cache regressions would have gone unseen.
+        print("PARTIAL: origin and upload abuse healthy, CDN unchecked")
     else:
         print("ALL CLEAR: no hotlinking, no upload abuse, origin healthy")
-    return 1 if alerts else 0
+
+    # Repeated in the summary even when alerting, so the gap is visible to anyone who
+    # reads only the last few lines.
+    if cf_unavailable:
+        print(f"  CDN unchecked: {cf_unavailable}")
+
+    if alerts:
+        return 1
+    # Distinct from an alert so a cron can tell "needs a new token" from "something is wrong".
+    return 2 if cf_unavailable else 0
 
 
 if __name__ == "__main__":
