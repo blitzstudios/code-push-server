@@ -33,6 +33,14 @@ const UPDATECHECK_CACHE_SCHEMA_VERSION = "v2";
 // answer rather than a hung request the user resolves by force-quitting.
 const UPDATECHECK_STORAGE_TIMEOUT_MS: number = Number(process.env.UPDATECHECK_STORAGE_TIMEOUT_MS) || 10000;
 
+// Redis only earns its place by answering faster than the storage lookup it stands in
+// front of, so a read slower than this has nothing left to offer and is treated as a
+// miss. Guarding against a slow cache matters as much as guarding against a broken one:
+// the failure path below has no deadline of its own, and on an instance whose network
+// degraded that left update checks open for nearly two minutes, well past the point
+// where clients and the CDN abandoned them and the platform answered 5xx on our behalf.
+const UPDATECHECK_REDIS_TIMEOUT_MS: number = Number(process.env.UPDATECHECK_REDIS_TIMEOUT_MS) || 1000;
+
 const HEALTH_PROBE_INTERVAL_MS: number = Number(process.env.HEALTH_PROBE_INTERVAL_MS) || 15000;
 const HEALTH_PROBE_TIMEOUT_MS: number = Number(process.env.HEALTH_PROBE_TIMEOUT_MS) || 5000;
 const HEALTH_FAILURE_THRESHOLD: number = Number(process.env.HEALTH_FAILURE_THRESHOLD) || 3;
@@ -203,8 +211,10 @@ export function getAcquisitionRouter(config: AcquisitionConfig): express.Router 
 
     redisManager
       .getCachedResponse(key, url)
+      .timeout(UPDATECHECK_REDIS_TIMEOUT_MS, "updateCheck redis lookup timed out")
       .catch((error: Error) => {
-        // Store the redis error to be thrown after we send response.
+        // Store the redis error to be thrown after we send response. A timeout arrives
+        // here too and is handled identically: no cached answer, fall through to storage.
         redisError = error;
         return q<redis.CacheableResponse>(null);
       })
