@@ -6,6 +6,11 @@ import { Microcache } from "./microcache";
 import { DiffMapFetcher } from "./acquisition";
 
 const DIFFPACKAGE_MEM_TTL_MS: number = Number(process.env.DIFFPACKAGE_MEM_TTL_MS) || 5 * 60 * 1000;
+// Losing the diff map costs the client a full-bundle download instead of a patch, which
+// is a bandwidth bill. Waiting on a stalled Redis costs it the whole update check, which
+// is a blocked app launch. This sits on the response path, so it gets a deadline and the
+// existing fallback absorbs the miss.
+const DIFFMAP_TIMEOUT_MS: number = Number(process.env.DIFFMAP_TIMEOUT_MS) || 1000;
 // Memoizes per-release diff map lookups so burst traffic only hits Redis once per package hash.
 const diffMapCache = new Microcache<q.Promise<PackageHashToBlobInfoMap>>(DIFFPACKAGE_MEM_TTL_MS);
 
@@ -27,6 +32,7 @@ export function createDiffMapFetcher(deploymentKey: string, redisManager: redis.
 
     return redisManager
       .getPackageDiffMap(deploymentKey, packageHash)
+      .timeout(DIFFMAP_TIMEOUT_MS, "diff map lookup timed out")
       .then((diffMap) => {
         const normalizedDiffMap = diffMap || null;
         const resolvedPromise = q<PackageHashToBlobInfoMap>(normalizedDiffMap);
