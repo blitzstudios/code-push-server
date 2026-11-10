@@ -16,6 +16,7 @@ import * as validationUtils from "../utils/validation";
 import * as q from "q";
 import Promise = q.Promise;
 import { Microcache } from "../utils/microcache";
+import { LookupHealth } from "../utils/lookup-health";
 import { ParsedUpdateCheckRequest, buildUpdateCheckCacheKey, parseUpdateCheckRequest } from "../utils/update-check-request";
 import { createDiffMapFetcher, primeDiffCacheForReleases } from "../utils/diff-cache";
 import { SendUpdateCheckOptions, sendUpdateCheckResponse } from "../utils/update-check-response";
@@ -44,6 +45,35 @@ const UPDATECHECK_REDIS_TIMEOUT_MS: number = Number(process.env.UPDATECHECK_REDI
 const HEALTH_PROBE_INTERVAL_MS: number = Number(process.env.HEALTH_PROBE_INTERVAL_MS) || 15000;
 const HEALTH_PROBE_TIMEOUT_MS: number = Number(process.env.HEALTH_PROBE_TIMEOUT_MS) || 5000;
 const HEALTH_FAILURE_THRESHOLD: number = Number(process.env.HEALTH_FAILURE_THRESHOLD) || 3;
+
+// The probe above asks whether storage answers a small request. An instance can pass that
+// while the lookups update_check actually makes run to the storage deadline, and it then
+// keeps its share of traffic while answering every miss slowly with no update. Judging the
+// instance by its own lookups closes that gap. The minimum count keeps a quiet instance or
+// a one-minute blip from tripping it, and the ratio keeps a few slow reads among many good
+// ones from doing so. The load balancer will not pull more than half the fleet, nor any
+// instance when all are failing, so a shared storage outage cannot empty the rotation.
+const UPDATECHECK_LOOKUP_HEALTH = new LookupHealth({
+  windowMs: Number(process.env.UPDATECHECK_HEALTH_WINDOW_MS) || 60000,
+  minFailures: Number(process.env.UPDATECHECK_HEALTH_MIN_FAILURES) || 20,
+  failureRatio: Number(process.env.UPDATECHECK_HEALTH_FAILURE_RATIO) || 0.5,
+  holdMs: Number(process.env.UPDATECHECK_HEALTH_HOLD_MS) || 10 * 60 * 1000,
+});
+
+// Failures that describe the request rather than this instance's reach to storage. An
+// unknown deployment key fails identically on every instance, so counting these would let
+// a stale client or a scanner mark the whole fleet unhealthy at once.
+const REQUEST_SHAPED_STORAGE_ERRORS: storageTypes.ErrorCode[] = [
+  storageTypes.ErrorCode.NotFound,
+  storageTypes.ErrorCode.AlreadyExists,
+  storageTypes.ErrorCode.TooLarge,
+  storageTypes.ErrorCode.Expired,
+  storageTypes.ErrorCode.Invalid,
+];
+
+function isInstanceFailure(error: any): boolean {
+  return !(error && REQUEST_SHAPED_STORAGE_ERRORS.indexOf(error.code) !== -1);
+}
 
 export interface AcquisitionConfig {
   storage: storageTypes.Storage;
@@ -167,6 +197,19 @@ export function getHealthRouter(config: AcquisitionConfig): express.Router {
       return;
     }
 
+    if (UPDATECHECK_LOOKUP_HEALTH.isFailing()) {
+      const totals = UPDATECHECK_LOOKUP_HEALTH.totals();
+      errorUtils.sendUnknownError(
+        res,
+        new Error(
+          `update_check storage lookups are failing on this instance ` +
+            `(${totals.failures} failed, ${totals.successes} succeeded in the current window)`
+        ),
+        next
+      );
+      return;
+    }
+
     res.status(200).send("Healthy");
   });
 
@@ -226,10 +269,22 @@ export function getAcquisitionRouter(config: AcquisitionConfig): express.Router 
 
         return createResponseUsingStorage(parsedRequest, res, storage, redisManager)
           .timeout(UPDATECHECK_STORAGE_TIMEOUT_MS, "updateCheck storage lookup timed out")
+          .then((response: redis.CacheableResponse) => {
+            // Null means the request was malformed and answered without a lookup.
+            if (response) {
+              UPDATECHECK_LOOKUP_HEALTH.record(true);
+            }
+
+            return response;
+          })
           .catch((error: any): redis.CacheableResponse => {
             // createResponseUsingStorage answers malformed requests itself.
             if (res.headersSent) {
               return null;
+            }
+
+            if (isInstanceFailure(error)) {
+              UPDATECHECK_LOOKUP_HEALTH.record(false);
             }
 
             // "No update available" is safe and idempotent: the client walks

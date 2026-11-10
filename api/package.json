@@ -9,7 +9,7 @@
     "clean": "rimraf bin",
     "build": "tsc && shx cp -r ./script/views ./bin/script",
     "pretest": "npm run build && shx cp -r ./test/resources ./bin/test/",
-    "test": "mocha bin/test/converter.js bin/test/package-diffing.js bin/test/security.js --timeout 120000",
+    "test": "mocha bin/test/converter.js bin/test/package-diffing.js bin/test/security.js bin/test/lookup-health.js --timeout 120000",
     "prettier": "prettier --write \"./**/*.ts\"",
     "lint": "npx eslint ./script/**/*.ts",
     "lint:fix": "npx eslint ./script/**/*.ts --fix"
